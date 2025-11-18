@@ -1,35 +1,34 @@
 # TinyZero
 
-![image](cover.png)
+TinyZero is a reproduction and extension of [DeepSeek R1 Zero](https://github.com/deepseek-ai/DeepSeek-R1) on the **Countdown** (arithmetic expression search) and multiplication tasks, built on top of [veRL](https://github.com/volcengine/verl).
 
-TinyZero is a reproduction of [DeepSeek R1 Zero](https://github.com/deepseek-ai/DeepSeek-R1) in countdown and multiplication tasks. We built upon [veRL](https://github.com/volcengine/verl).
+This fork adds a **compute‑efficient adaptive rollout curriculum** for RL with long‑context reasoning models, plus tooling to run ablations, log rich diagnostics, and evaluate trained checkpoints reproducibly.
 
-Through RL, the 3B base LM develops self-verification and search abilities all on its own 
+> Key result (Countdown): a 1.5B DeepSeek‑distilled model trained with our **adaptive rollout** schedule matches and slightly exceeds a full 4K rollout baseline and even outperforms a 7B base model, while using tokens more efficiently.
 
-You can experience the Ahah moment yourself for < $30 
-
-Twitter thread: https://x.com/jiayi_pirate/status/1882839370505621655
-
-Full experiment log: https://wandb.ai/jiayipan/TinyZero
-
-> 📢: We release [Apative Parallel Reasoning](https://github.com/Parallel-Reasoning/APR), where we explore a new dimension in scaling reasoining models
+---
 
 ## Installation
 
-```
-conda create -n zero python=3.9
-# install torch [or you can skip this step and let vllm to install the correct version for you]
-pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
-# install vllm
-pip3 install vllm==0.6.3 # or you can install 0.5.4, 0.4.2 and 0.3.1
-pip3 install ray
+We recommend using a dedicated Conda environment.
 
-# verl
+```bash
+conda create -n zero python=3.9
+conda activate zero
+
+# PyTorch (or skip and let vLLM install a matching wheel)
+pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+
+# vLLM + Ray
+pip install "vllm==0.6.3" ray
+
+# Install TinyZero (this repo) + veRL
 pip install -e .
 
-# flash attention 2
-pip3 install flash-attn --no-build-isolation
-# quality of life
+# FlashAttention 2 (optional but recommended for speed on H100/A100)
+pip install flash-attn --no-build-isolation
+
+# Quality of life
 pip install wandb IPython matplotlib
 ```
 
