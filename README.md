@@ -2,7 +2,7 @@
 
 TinyZero is a reproduction and extension of [DeepSeek R1 Zero](https://github.com/deepseek-ai/DeepSeek-R1) on the **Countdown** (arithmetic expression search) and multiplication tasks, built on top of [veRL](https://github.com/volcengine/verl).
 
-This fork adds a **compute‑efficient adaptive rollout curriculum** for RL with long‑context reasoning models, plus tooling to run ablations, log rich diagnostics, and evaluate trained checkpoints reproducibly.
+On top of the original setup, this codebase adds a **compute‑efficient adaptive rollout curriculum** for RL with long‑context reasoning models, plus tooling to run ablations, log rich diagnostics, and evaluate trained checkpoints reproducibly.
 
 > Key result (Countdown): a 1.5B DeepSeek‑distilled model trained with our **adaptive rollout** schedule matches and slightly exceeds a full 4K rollout baseline and even outperforms a 7B base model, while using tokens more efficiently.
 
@@ -99,8 +99,6 @@ bash ./scripts/train_tiny_zero.sh
 
 ## Adaptive rollout extensions
 
-This fork adds several new ways to control the rollout length and analyze long‑context RL runs on Countdown.
-
 ### Training modes
 
 - **Full rollout (baseline)**  
@@ -117,17 +115,6 @@ This fork adds several new ways to control the rollout length and analyze long�
     - Occasionally explore the max window via epsilon‑greedy.
   - All behavior is controlled by `agent.adaptive_window.*` in `verl/trainer/config/ppo_trainer.yaml`.
 
-- **Phased schedule (manual curriculum)**  
-  - Script: `scripts/train_tiny_zero_phased.sh`  
-  - Runs individual phases at fixed lengths (512 / 1024 / 2048 / 4096).  
-  - Script: `scripts/train_tiny_zero_phased_schedule.sh`  
-    - Chains phases into a 4‑stage curriculum, e.g. 200 steps @ 512, 100 @ 1024, 50 @ 2048, 50 @ 4096.
-
-- **Cosine rollout schedule**  
-  - Script: `scripts/train_tiny_zero_cosine.sh`  
-  - Interpolates the rollout length between `L_MIN` and `L_MAX` over several phases using a cosine schedule:
-    - Configure with `L_MIN`, `L_MAX`, `N_PHASES` environment variables.
-
 - **Vanilla fixed‑length baseline**  
   - Script: `scripts/train_tiny_zero_vanilla.sh`  
   - Disables the adaptive controller (`agent.adaptive_window.enable=False`) and keeps a fixed `data.max_response_length`.
@@ -136,7 +123,7 @@ All these modes share the same PPO/GRPO trainer (`verl/trainer/ppo/ray_trainer.p
 
 ### GRPO and reward shaping
 
-- By default, this fork uses **GRPO**:
+- By default, this codebase uses **GRPO**:
   - `algorithm.adv_estimator=grpo`,
   - multiple samples per prompt (`actor_rollout_ref.rollout.n`),
   - actor‑side KL loss (`use_kl_loss=True`, `kl_loss_type=low_var_kl`).
@@ -166,7 +153,7 @@ To study stability and efficiency, the trainer logs additional metrics to W&B:
 - **Learning curves**
   - `train/cumulative_reward` and `time/elapsed_s` to plot reward vs. wall‑clock.
 
-These metrics make it easy to compare full vs. adaptive vs. phased vs. cosine runs on both **final accuracy** and **compute efficiency (tokens / time)**.
+These metrics make it easy to compare full‑rollout vs. adaptive vs. vanilla fixed‑length runs on both **final accuracy** and **compute efficiency (tokens / time)**.
 
 ## Acknowledge
 * We run our experiments based on [veRL](https://github.com/volcengine/verl).
