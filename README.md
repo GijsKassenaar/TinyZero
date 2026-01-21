@@ -33,7 +33,7 @@ pip install wandb IPython matplotlib
 
 Or on Snellius
 
-conda activate zero ( directly activates right conda env)
+conda activate zero ( directly activates right conda env) 
 ```
 
 
