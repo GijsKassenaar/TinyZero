@@ -207,3 +207,10 @@ agent:
     ema_bias_correction: true
     # Rolling mode params
     rolling_window: 100
+
+  # Entropy logging configuration
+  entropy_logging:
+    enable: false
+    # Directory to save entropy data (relative to default_local_dir or absolute)
+    output_dir: entropy_data
+  

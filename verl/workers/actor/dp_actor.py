@@ -53,13 +53,15 @@ class DataParallelPPOActor(BasePPOActor):
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
-        self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
+        # Compile entropy+varentropy computation for efficiency
+        self.compute_entropy_and_varentropy = torch.compile(verl_F.entropy_and_varentropy_from_logits, dynamic=True)
 
-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns: 
-            entropy: # (bs, response_len)
-            log_probs: # (bs, response_len)
+            entropy: # (bs, response_len) - Shannon entropy per token
+            varentropy: # (bs, response_len) - variance of log probs per token  
+            log_probs: # (bs, response_len) - log prob of selected token
         """
         response_length = micro_batch['responses'].size(-1)
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -99,8 +101,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 logits_rmpad.div_(temperature)
 
-                # compute entropy
-                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                # compute entropy and varentropy together efficiently
+                entropy_rmpad, varentropy_rmpad = self.compute_entropy_and_varentropy(logits_rmpad)
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
@@ -113,11 +115,19 @@ class DataParallelPPOActor(BasePPOActor):
                                                             gather_dim=0,
                                                             unpad_dim=0,
                                                             padding_size=pad_size)
+                    varentropy_rmpad = gather_outpus_and_unpad(varentropy_rmpad,
+                                                               gather_dim=0,
+                                                               unpad_dim=0,
+                                                               padding_size=pad_size)
                 # pad back to (bsz, seqlen)
                 full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
                                          indices=indices,
                                          batch=batch_size,
                                          seqlen=seqlen)
+                full_varentropy = pad_input(hidden_states=varentropy_rmpad.unsqueeze(-1),
+                                            indices=indices,
+                                            batch=batch_size,
+                                            seqlen=seqlen)
                 full_log_probs = pad_input(hidden_states=log_probs.unsqueeze(-1),
                                            indices=indices,
                                            batch=batch_size,
@@ -125,6 +135,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # only return response part:
                 entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
+                varentropy = full_varentropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
@@ -136,9 +147,10 @@ class DataParallelPPOActor(BasePPOActor):
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1]  # (bsz, response_length)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                # compute entropy and varentropy together
+                entropy, varentropy = verl_F.entropy_and_varentropy_from_logits(logits)
 
-            return entropy, log_probs
+            return entropy, varentropy, log_probs
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -150,7 +162,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.step()
         return grad_norm
 
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, return_entropy: bool = False):
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -165,8 +177,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
+            return_entropy (bool): If True, also return per-token entropy and varentropy.
+                Useful for analyzing model confidence during rollout generation.
+
         Returns:
-            torch.Tensor: the log_prob tensor
+            torch.Tensor or Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: 
+                - If return_entropy=False: log_prob tensor (batch_size, response_length)
+                - If return_entropy=True: (log_prob, entropy, varentropy) tuple
         """
         # set to eval
         self.actor_module.eval()
@@ -186,18 +203,33 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batches = batch.split(micro_batch_size)
 
         log_probs_lst = []
+        entropy_lst = []
+        varentropy_lst = []
         for micro_batch in micro_batches:
             with torch.no_grad():
-                _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
+                # _forward_micro_batch returns (entropy, varentropy, log_probs)
+                entropy, varentropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
             log_probs_lst.append(log_probs)
+            if return_entropy:
+                entropy_lst.append(entropy)
+                varentropy_lst.append(varentropy)
+        
         log_probs = torch.concat(log_probs_lst, dim=0)
+        if return_entropy:
+            entropy = torch.concat(entropy_lst, dim=0)
+            varentropy = torch.concat(varentropy_lst, dim=0)
 
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
+            if return_entropy:
+                entropy = entropy[revert_indices]
+                varentropy = varentropy[revert_indices]
 
+        if return_entropy:
+            return log_probs, entropy, varentropy
         return log_probs
 
     def update_policy(self, data: DataProto):
@@ -242,8 +274,8 @@ class DataParallelPPOActor(BasePPOActor):
                 clip_ratio = self.config.clip_ratio
                 entropy_coeff = self.config.entropy_coeff
 
-                # all return: (bsz, response_length)
-                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                # all return: (bsz, response_length) - varentropy not needed for policy update
+                entropy, _, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
                 pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
                     old_log_prob=old_log_prob,

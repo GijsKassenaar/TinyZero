@@ -99,6 +99,67 @@ def entropy_from_logits(logits: torch.Tensor):
     return entropy
 
 
+def varentropy_from_logits(logits: torch.Tensor):
+    """Calculate varentropy (variance of log probabilities) from logits.
+    
+    Varentropy = Var_p[log p] = E_p[(log p)^2] - (E_p[log p])^2
+               = sum(p * (log p)^2) - H^2
+    
+    where H is the entropy (H = -E_p[log p]).
+    
+    Varentropy measures how "spread out" the probability mass is.
+    - Low varentropy + low entropy: confident on one token
+    - Low varentropy + high entropy: uniform distribution  
+    - High varentropy: some tokens have high prob, others very low (peaked but not unimodal)
+    
+    Args:
+        logits: tensor of shape (..., vocab_size)
+        
+    Returns:
+        varentropy: tensor of shape (...) - varentropy for each position
+    """
+    # Compute log probabilities
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    # Compute probabilities
+    probs = torch.exp(log_probs)
+    
+    # E_p[log p] = sum(p * log p) = -H (negative entropy)
+    neg_entropy = torch.sum(probs * log_probs, dim=-1)
+    
+    # E_p[(log p)^2] = sum(p * (log p)^2)
+    expected_log_sq = torch.sum(probs * (log_probs ** 2), dim=-1)
+    
+    # Var[log p] = E[(log p)^2] - E[log p]^2
+    varentropy = expected_log_sq - (neg_entropy ** 2)
+    
+    return varentropy
+
+
+def entropy_and_varentropy_from_logits(logits: torch.Tensor):
+    """Calculate both entropy and varentropy efficiently in one pass.
+    
+    Args:
+        logits: tensor of shape (..., vocab_size)
+        
+    Returns:
+        entropy: tensor of shape (...)
+        varentropy: tensor of shape (...)
+    """
+    # Compute log probabilities and probabilities
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    probs = torch.exp(log_probs)
+    
+    # Entropy: H = -sum(p * log p)
+    neg_entropy = torch.sum(probs * log_probs, dim=-1)  # This is -H
+    entropy = -neg_entropy
+    
+    # Varentropy: Var[log p] = E[(log p)^2] - E[log p]^2
+    expected_log_sq = torch.sum(probs * (log_probs ** 2), dim=-1)
+    varentropy = expected_log_sq - (neg_entropy ** 2)
+    
+    return entropy, varentropy
+
+
 def masked_sum(values, mask, axis=None):
     """Compute mean of tensor with a masked values."""
     return (values * mask).sum(axis=axis)

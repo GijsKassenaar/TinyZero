@@ -836,6 +836,10 @@ class RayPPOTrainer(object):
                     # Meta-info is used by the rollout worker (e.g. vLLM) to override max_tokens.
                     gen_batch.meta_info.setdefault('max_tokens', max_tokens)
 
+                # Pass entropy logging config to workers
+                entropy_cfg = self.config.agent.get('entropy_logging', {})
+                gen_batch.meta_info['compute_entropy'] = entropy_cfg.get('enable', False)
+
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
@@ -1009,7 +1013,7 @@ class RayPPOTrainer(object):
                 # Save per-token entropy and varentropy data to disk for analysis
                 # Data is saved to: {default_local_dir}/entropy_data/entropy_step_{step}.pt
                 entropy_cfg = self.config.agent.get('entropy_logging', {})
-                if entropy_cfg.get('enable', False) or 'old_entropy' in batch.batch.keys():
+                if entropy_cfg.get('enable', False) and 'old_entropy' in batch.batch.keys():
                     entropy_output_dir = os.path.join(
                         self.config.trainer.default_local_dir, 
                         entropy_cfg.get('output_dir', 'entropy_data')

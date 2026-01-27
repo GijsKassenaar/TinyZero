@@ -428,11 +428,22 @@ class ActorRolloutRefWorker(Worker):
             output.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
             output.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
             output.meta_info['temperature'] = self.config.rollout.temperature
-            # perform recompute log_prob
+            
+            # Check if entropy logging is enabled via config
+            compute_entropy = output.meta_info.get('compute_entropy', False)
+            
             with self.ulysses_sharding_manager:
                 output = self.ulysses_sharding_manager.preprocess_data(output)
-                old_log_probs = self.actor.compute_log_prob(data=output)
-                output.batch['old_log_probs'] = old_log_probs
+                if compute_entropy:
+                    # Compute log_prob, entropy, and varentropy from the rollout policy
+                    old_log_probs, old_entropy, old_varentropy = self.actor.compute_log_prob(data=output, return_entropy=True)
+                    output.batch['old_log_probs'] = old_log_probs
+                    output.batch['old_entropy'] = old_entropy  # per-token entropy (batch, response_len)
+                    output.batch['old_varentropy'] = old_varentropy  # per-token varentropy (batch, response_len)
+                else:
+                    # Only compute log_prob (default, no entropy overhead)
+                    old_log_probs = self.actor.compute_log_prob(data=output, return_entropy=False)
+                    output.batch['old_log_probs'] = old_log_probs
                 output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to('cpu')
