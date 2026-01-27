@@ -34,6 +34,7 @@ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClass
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.adaptive_window import AdaptiveSuccessWindowConfig, AdaptiveSuccessWindowController
+from verl.trainer.ppo.sgrpo import SGRPOConfig, SGRPOController
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 WorkerType = Type[Worker]
@@ -114,9 +115,22 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, decay_factor=2.0):
+    """Compute advantages based on the specified estimator.
+    
+    Args:
+        data: DataProto containing rewards and other batch data.
+        adv_estimator: One of 'gae', 'grpo', or 'sgrpo'.
+        gamma: Discount factor for GAE.
+        lam: Lambda for GAE.
+        num_repeat: Number of responses per prompt (for GRPO/S-GRPO).
+        decay_factor: Exponential decay factor for S-GRPO rewards (only used when adv_estimator='sgrpo').
+                      Reward is divided by decay_factor for each later exit position.
+    
+    Returns:
+        data: DataProto with 'advantages' and 'returns' added to batch.
+    """
     # prepare response group
-    # TODO: add other ways to estimate advantages
     if adv_estimator == 'gae':
         values = data.batch['values']
         responses = data.batch['responses']
@@ -143,8 +157,34 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                                                                         index=index)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == 'sgrpo':
+        # S-GRPO: Serial-Group Decaying-Reward Policy Optimization
+        # Uses exponentially decaying rewards based on exit order within serial groups
+        token_level_rewards = data.batch['token_level_rewards']
+        index = data.non_tensor_batch['uid']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        
+        # Get exit order (required for S-GRPO)
+        if 'exit_order' in data.batch.keys():
+            exit_order = data.batch['exit_order']
+        else:
+            # Fallback: assume all samples are full responses (exit_order = num_repeat)
+            exit_order = torch.ones(token_level_rewards.shape[0], dtype=torch.long) * num_repeat
+        
+        advantages, returns = core_algos.compute_sgrpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            eos_mask=response_mask,
+            index=index,
+            exit_order=exit_order,
+            decay_factor=decay_factor
+        )
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
-        raise NotImplementedError
+        raise NotImplementedError(f"Unknown advantage estimator: {adv_estimator}")
     return data
 
 
@@ -255,7 +295,44 @@ def compute_data_metrics(batch, use_critic=True):
         'prompt_length/clip_ratio':
             torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+    
     return metrics
+
+
+def save_entropy_data(batch, step: int, output_dir: str):
+    """Save per-token entropy and varentropy for each rollout to disk.
+    
+    Saves a .pt file containing:
+    - old_entropy: (batch_size, response_length) - Shannon entropy per token
+    - old_varentropy: (batch_size, response_length) - variance of log probs per token
+    - attention_mask: (batch_size, prompt_length + response_length) - to identify valid tokens
+    - responses: (batch_size, response_length) - the actual token ids
+    
+    Args:
+        batch: DataProto with rollout data
+        step: Current training step
+        output_dir: Directory to save entropy data
+    """
+    import os
+    
+    if 'old_entropy' not in batch.batch.keys():
+        return
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Extract tensors to save
+    save_dict = {
+        'step': step,
+        'old_entropy': batch.batch['old_entropy'].cpu(),  # (batch, response_len)
+        'old_varentropy': batch.batch['old_varentropy'].cpu(),  # (batch, response_len)
+        'attention_mask': batch.batch['attention_mask'].cpu(),  # (batch, prompt_len + response_len)
+        'responses': batch.batch['responses'].cpu(),  # (batch, response_len) - token ids
+    }
+    
+    # Save to file
+    filepath = os.path.join(output_dir, f'entropy_step_{step:06d}.pt')
+    torch.save(save_dict, filepath)
+    print(f"[Entropy] Saved entropy data for step {step} to {filepath}")
 
 
 def compute_timing_metrics(batch, timing_raw):
@@ -462,6 +539,25 @@ class RayPPOTrainer(object):
                 adaptive_cfg_dict = OmegaConf.to_container(adaptive_cfg, resolve=True)
                 aw_config = AdaptiveSuccessWindowConfig(**adaptive_cfg_dict)
                 self._adaptive_window = AdaptiveSuccessWindowController(config=aw_config)
+
+        # S-GRPO controller (for serial-group decaying-reward optimization) ----
+        self._sgrpo_controller: SGRPOController | None = None
+        algo_cfg = self.config.get('algorithm', None)
+        if algo_cfg is not None:
+            sgrpo_cfg = algo_cfg.get('sgrpo', None)
+            if sgrpo_cfg is not None and sgrpo_cfg.get('enable', False):
+                # Convert OmegaConf node into a plain dict and hydrate dataclass
+                sgrpo_cfg_dict = OmegaConf.to_container(sgrpo_cfg, resolve=True)
+                sgrpo_config = SGRPOConfig(**sgrpo_cfg_dict)
+                max_response_length = self.config.data.max_response_length
+                self._sgrpo_controller = SGRPOController(
+                    config=sgrpo_config,
+                    tokenizer=tokenizer,
+                    max_response_length=max_response_length
+                )
+                print(f"[S-GRPO] Enabled with num_exits={sgrpo_config.num_exits}, "
+                      f"decay_factor={sgrpo_config.decay_factor}, "
+                      f"exit_method={sgrpo_config.exit_method}")
 
         # define KL control
         if self.use_reference_policy:
@@ -743,13 +839,48 @@ class RayPPOTrainer(object):
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-
-                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                        # Check if S-GRPO is enabled for two-phase generation
+                        if self._sgrpo_controller is not None:
+                            # S-GRPO Two-Phase Generation:
+                            # Phase 1: Generate ONE complete response per prompt
+                            # Note: rollout.n should be set to 1 in config for S-GRPO
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            
+                            # Phase 2: Create serial group with K truncated versions
+                            # This generates continuations for truncated prompts
+                            serial_group, exit_orders = self._sgrpo_controller.create_serial_group_two_phase(
+                                full_responses=gen_batch_output,
+                                generate_fn=self.actor_rollout_wg.generate_sequences,
+                                max_new_tokens=256  # Enough for generating just the answer part
+                            )
+                            
+                            # For S-GRPO, we have K samples per original prompt
+                            num_exits = self._sgrpo_controller.config.num_exits
+                            
+                            batch.non_tensor_batch['uid'] = np.array(
+                                [str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                dtype=object
+                            )
+                            # Repeat to match serial group size (K versions per prompt)
+                            batch = batch.repeat(repeat_times=num_exits, interleave=True)
+                            batch = batch.union(serial_group)
+                            
+                            # Store exit_orders in the batch for advantage computation
+                            batch.batch['exit_order'] = exit_orders
+                            
+                            print(f"[S-GRPO] Created serial group: {len(batch.batch['input_ids'])} samples "
+                                  f"({len(batch.batch['input_ids']) // num_exits} prompts × {num_exits} exits)")
+                        else:
+                            # Standard GRPO/GAE flow: generate n rollouts per prompt
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            
+                            batch.non_tensor_batch['uid'] = np.array(
+                                [str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                dtype=object
+                            )
+                            # repeat to align with repeated responses in rollout
+                            batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                            batch = batch.union(gen_batch_output)
 
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
@@ -794,11 +925,17 @@ class RayPPOTrainer(object):
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
+                        # Get S-GRPO decay_factor if enabled, otherwise use default
+                        sgrpo_decay_factor = 2.0
+                        if self._sgrpo_controller is not None:
+                            sgrpo_decay_factor = self._sgrpo_controller.config.decay_factor
+                        
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                                                  num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                                  decay_factor=sgrpo_decay_factor)
 
                         # Accumulate total rewards (after KL shaping if used)
                         step_total_reward = batch.batch['token_level_rewards'].sum().item()
@@ -811,6 +948,14 @@ class RayPPOTrainer(object):
                                 batch=batch,
                                 reward_tensor=batch.batch['token_level_rewards'])
                             metrics.update(aw_metrics)
+                        
+                        # Update S-GRPO controller and log its metrics
+                        if self._sgrpo_controller is not None and 'exit_order' in batch.batch.keys():
+                            sgrpo_metrics = self._sgrpo_controller.update_statistics(
+                                rewards=batch.batch['token_level_rewards'],
+                                exit_orders=batch.batch['exit_order']
+                            )
+                            metrics.update(sgrpo_metrics)
 
                     # update critic
                     if self.use_critic:
@@ -860,6 +1005,16 @@ class RayPPOTrainer(object):
                     generation_budget = int(self.config.data.max_response_length)
                 completion_metrics = compute_completion_metrics(batch=batch, generation_budget=generation_budget)
                 metrics.update(completion_metrics)
+
+                # Save per-token entropy and varentropy data to disk for analysis
+                # Data is saved to: {default_local_dir}/entropy_data/entropy_step_{step}.pt
+                entropy_cfg = self.config.agent.get('entropy_logging', {})
+                if entropy_cfg.get('enable', False) or 'old_entropy' in batch.batch.keys():
+                    entropy_output_dir = os.path.join(
+                        self.config.trainer.default_local_dir, 
+                        entropy_cfg.get('output_dir', 'entropy_data')
+                    )
+                    save_entropy_data(batch=batch, step=self.global_steps, output_dir=entropy_output_dir)
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)

@@ -155,6 +155,117 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
     return scores, scores
 
 
+def compute_sgrpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    eos_mask: torch.Tensor,
+    index: torch.Tensor,
+    exit_order: torch.Tensor,
+    decay_factor: float = 2.0,
+    epsilon: float = 1e-6
+):
+    """
+    Compute advantage for S-GRPO (Serial-Group Decaying-Reward Policy Optimization).
+    
+    S-GRPO differs from GRPO by:
+    1. Using exponentially decaying rewards based on exit order (earlier exits get higher rewards)
+    2. Grouping by prompt ID to normalize within serial groups
+    
+    The exponential decaying reward formula for correct answers:
+        r_i = R_base / (decay_factor ^ (exit_order - 1))
+    
+    Where exit_order=1 is the earliest exit, exit_order=K is the full response.
+    Wrong answers always get reward 0.
+    
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length). Original task rewards (0 or 1 for correct/wrong).
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length). [EOS] mask. Tokens after [EOS] have mask zero.
+        index: `(torch.Tensor or np.ndarray)`
+            shape: (bs,). Prompt ID for grouping (samples with same ID form a serial group).
+        exit_order: `(torch.Tensor)`
+            shape: (bs,). Exit order within serial group (1 to K, where K is num_exits).
+        decay_factor: `(float)`
+            Exponential decay factor. Reward is divided by this for each later exit.
+            Default is 2.0 (halves reward for each later exit).
+        epsilon: `(float)`
+            Small value for numerical stability in normalization.
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length). Normalized advantages with decaying rewards.
+        returns: `(torch.Tensor)`
+            shape: (bs, response_length). Same as advantages for S-GRPO.
+    
+    Example:
+        With decay_factor=2.0 and 4 exits, a correct answer gets:
+        - Exit 1 (earliest): r = 1.0 / 2^0 = 1.0
+        - Exit 2: r = 1.0 / 2^1 = 0.5
+        - Exit 3: r = 1.0 / 2^2 = 0.25
+        - Exit 4 (full): r = 1.0 / 2^3 = 0.125
+        
+        This strongly encourages the model to produce correct answers earlier.
+    """
+    response_length = token_level_rewards.shape[-1]
+    
+    # Get scalar reward per sample (sum across sequence)
+    non_zero_mask = (token_level_rewards != 0)
+    base_scores = (token_level_rewards * non_zero_mask).sum(dim=-1)  # (bs,)
+    
+    # Apply exponential decaying rewards
+    # For correct answers (base_score > 0): r = base_score / (decay_factor ^ (exit_order - 1))
+    # For wrong answers: r = 0
+    exit_order_float = exit_order.float().to(base_scores.device)
+    decay_divisor = torch.pow(torch.tensor(decay_factor, device=base_scores.device), exit_order_float - 1)
+    
+    # Only apply decay to correct answers (positive rewards)
+    is_correct = (base_scores > 0.5).float()
+    decayed_scores = is_correct * (base_scores / decay_divisor)
+    
+    # Group by prompt ID and normalize within each serial group
+    id2score = defaultdict(list)
+    id2indices = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+    
+    with torch.no_grad():
+        bsz = decayed_scores.shape[0]
+        
+        # Collect scores by prompt ID
+        for i in range(bsz):
+            prompt_id = index[i]
+            id2score[prompt_id].append(decayed_scores[i])
+            id2indices[prompt_id].append(i)
+        
+        # Compute mean and std for each serial group
+        for prompt_id in id2score:
+            scores_list = id2score[prompt_id]
+            if len(scores_list) == 1:
+                # Single sample: no normalization
+                id2mean[prompt_id] = torch.tensor(0.0, device=decayed_scores.device)
+                id2std[prompt_id] = torch.tensor(1.0, device=decayed_scores.device)
+            elif len(scores_list) > 1:
+                scores_tensor = torch.stack(scores_list)
+                id2mean[prompt_id] = scores_tensor.mean()
+                id2std[prompt_id] = scores_tensor.std()
+                # Handle edge case where all scores are the same
+                if id2std[prompt_id] < epsilon:
+                    id2std[prompt_id] = torch.tensor(1.0, device=decayed_scores.device)
+            else:
+                raise ValueError(f"No scores found for prompt index: {prompt_id}")
+        
+        # Normalize scores within each serial group
+        normalized_scores = decayed_scores.clone()
+        for i in range(bsz):
+            prompt_id = index[i]
+            normalized_scores[i] = (decayed_scores[i] - id2mean[prompt_id]) / (id2std[prompt_id] + epsilon)
+        
+        # Broadcast to response length and apply mask
+        advantages = normalized_scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
+    
+    return advantages, advantages
+
+
 def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     kl = old_log_prob - ref_log_prob
     return token_level_scores - kl * kl_ratio

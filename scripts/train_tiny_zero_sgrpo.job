@@ -1,0 +1,32 @@
+#!/bin/bash
+# SLURM job for TinyZero S-GRPO training
+# S-GRPO: Serial-Group Decaying-Reward Policy Optimization
+# Encourages early correct answers to reduce overthinking
+
+#SBATCH --job-name=tinyzero_sgrpo
+#SBATCH --partition=gpu_h100
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=36
+#SBATCH --mem=240G
+#SBATCH --time=24:00:00
+
+source ~/.bashrc
+conda activate zero
+
+# Set HuggingFace cache to scratch for larger storage
+export HF_HOME=/scratch-shared/$USER/huggingface
+mkdir -p $HF_HOME
+
+cd $HOME/TinyZero
+
+# Environment variables with defaults
+export DATA_DIR=${DATA_DIR:-$PWD}
+export BASE_MODEL=${BASE_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
+export N_GPUS=${N_GPUS:-4}
+export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-2}
+export EXPERIMENT_NAME=${EXPERIMENT_NAME:-tinyzero_sgrpo}
+
+# Run S-GRPO training
+bash scripts/train_tiny_zero_sgrpo.sh

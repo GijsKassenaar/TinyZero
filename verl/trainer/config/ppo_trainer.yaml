@@ -138,7 +138,7 @@ reward_model:
 algorithm:
   gamma: 1.0
   lam: 1.0
-  adv_estimator: grpo
+  adv_estimator: grpo  # Options: gae, grpo, sgrpo
   kl_penalty: kl
   use_kl_in_reward: false
   kl_ctrl:
@@ -159,6 +159,19 @@ algorithm:
     r_e: -1.0
     # Threshold on the base score to treat an answer as "correct"
     correct_threshold: 0.5
+  # S-GRPO: Serial-Group Decaying-Reward Policy Optimization
+  sgrpo:
+    enable: false
+    # Number of exit points in the serial group (K in the paper)
+    num_exits: 4
+    # Exponential reward decay factor: r_i = 1.0 / (decay_factor ^ (i - 1))
+    # With decay_factor=2: exit1=1.0, exit2=0.5, exit3=0.25, exit4=0.125
+    decay_factor: 2.0
+    # Exit position selection method. Currently only 'uniform' supported.
+    # Extensible for future methods (keyword, learned, etc.)
+    exit_method: uniform
+    # Answer inducer: string appended after truncation to force answer generation
+    answer_inducer: "Time is limited, stop thinking and start answering.\n</think>\n<answer>"
 
 trainer:
   total_epochs: 30
