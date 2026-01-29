@@ -39,10 +39,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=128 \
-    actor_rollout_ref.actor.ppo_micro_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size=16 \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=64 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=32 \
     algorithm.adv_estimator=grpo \
@@ -76,4 +76,4 @@ echo "Each file contains:"
 echo "  - old_entropy: (1024, response_len) - Shannon entropy per token"
 echo "  - old_varentropy: (1024, response_len) - Varentropy per token"
 echo "  - attention_mask: to identify valid tokens"
-echo "  - responses: token IDs"
+echo "  - rewards: (1024,) - Binary reward (0 or 1) per sample"

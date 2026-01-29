@@ -306,7 +306,7 @@ def save_entropy_data(batch, step: int, output_dir: str):
     - old_entropy: (batch_size, response_length) - Shannon entropy per token
     - old_varentropy: (batch_size, response_length) - variance of log probs per token
     - attention_mask: (batch_size, prompt_length + response_length) - to identify valid tokens
-    - responses: (batch_size, response_length) - the actual token ids
+    - rewards: (batch_size,) - binary reward (0 or 1) per sample
     
     Args:
         batch: DataProto with rollout data
@@ -320,14 +320,24 @@ def save_entropy_data(batch, step: int, output_dir: str):
     
     os.makedirs(output_dir, exist_ok=True)
     
+    # Extract binary reward (0 or 1) per sample
+    # The reward is placed at the EOS position, so summing gives the binary value
+    binary_rewards = None
+    if 'token_level_scores' in batch.batch.keys():
+        token_level_scores = batch.batch['token_level_scores']
+        binary_rewards = token_level_scores.sum(dim=-1).cpu()  # (batch,) - binary 0 or 1
+    
     # Extract tensors to save
     save_dict = {
         'step': step,
         'old_entropy': batch.batch['old_entropy'].cpu(),  # (batch, response_len)
         'old_varentropy': batch.batch['old_varentropy'].cpu(),  # (batch, response_len)
         'attention_mask': batch.batch['attention_mask'].cpu(),  # (batch, prompt_len + response_len)
-        'responses': batch.batch['responses'].cpu(),  # (batch, response_len) - token ids
     }
+    
+    # Add binary rewards if available
+    if binary_rewards is not None:
+        save_dict['rewards'] = binary_rewards  # (batch,) - binary reward (0 or 1)
     
     # Save to file
     filepath = os.path.join(output_dir, f'entropy_step_{step:06d}.pt')
