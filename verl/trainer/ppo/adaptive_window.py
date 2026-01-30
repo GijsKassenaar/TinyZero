@@ -59,7 +59,11 @@ class AdaptiveSuccessWindowConfig:
     # Success definition
     success_threshold: float = 1.0
 
-    # Mode: "basic" (all samples), "ema", "rolling"
+    # Mode: "basic" (all samples), "ema", "rolling", "phased"
+    # - "basic": adaptive with all success samples
+    # - "ema": adaptive with exponential moving average
+    # - "rolling": adaptive with rolling window of samples
+    # - "phased": simple step-based schedule (uses phased_schedule config)
     mode: str = "basic"
     rolling_window: int = 100
 
@@ -70,16 +74,28 @@ class AdaptiveSuccessWindowConfig:
     ema_beta: float = 0.98
     ema_bias_correction: bool = True
 
+    # Phased schedule (only used when mode == "phased")
+    # List of [step_threshold, window_size] pairs
+    # Example: [[10, 512], [20, 1024], [30, 2048]] means:
+    #   - steps 0-9: 512 tokens
+    #   - steps 10-19: 1024 tokens
+    #   - steps 20-29: 2048 tokens
+    #   - steps 30+: 2048 tokens (last window size is maintained)
+    phased_schedule: Optional[List[List[int]]] = None
+
 
 class AdaptiveSuccessWindowController:
     """Adaptive controller for the generation window (max_tokens).
 
-    The controller tracks lengths of successful completions and proposes a new
-    window size according to:
-
-        proposed_window = mean_success_length + (std_success_length * std_multiplier)
-
-    with optional EMA / rolling variants and epsilon-greedy exploration.
+    Supports multiple modes:
+    
+    - Adaptive modes ("basic", "ema", "rolling"): 
+      Tracks lengths of successful completions and adjusts window based on
+      success rate and curriculum learning. Uses epsilon-greedy exploration.
+    
+    - Phased mode ("phased"):
+      Simple step-based schedule where you specify exactly which window size
+      to use at which training step. No adaptation, just follows the schedule.
     """
 
     def __init__(self, config: AdaptiveSuccessWindowConfig):
@@ -125,6 +141,28 @@ class AdaptiveSuccessWindowController:
             return {}
 
         self.step_count += 1
+
+        # ------------------------------------------------------------------
+        # Phased schedule mode: simple step-based window changes
+        # ------------------------------------------------------------------
+        if self.config.mode == "phased":
+            if self.config.phased_schedule is not None and len(self.config.phased_schedule) > 0:
+                # Find the appropriate window size for the current step
+                current_phase_window = self.config.initial_window
+                for step_threshold, window_size in self.config.phased_schedule:
+                    if self.step_count >= step_threshold:
+                        current_phase_window = window_size
+                    else:
+                        break  # Schedule should be sorted, so stop at first future threshold
+                
+                self.current_window = int(current_phase_window)
+            
+            # Return simple metrics for phased mode (no adaptive statistics needed)
+            return {
+                "adaptive_window/current_window": float(self.current_window),
+                "adaptive_window/step_count": float(self.step_count),
+                "adaptive_window/mode": 0.0,  # 0 = phased mode
+            }
 
         # ------------------------------------------------------------------
         # Compute per-sequence rewards and response lengths
