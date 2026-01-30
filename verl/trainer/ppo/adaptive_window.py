@@ -149,7 +149,9 @@ class AdaptiveSuccessWindowController:
             if self.config.phased_schedule is not None and len(self.config.phased_schedule) > 0:
                 # Find the appropriate window size for the current step
                 current_phase_window = self.config.initial_window
+                print(f"Phased schedule")
                 for step_threshold, window_size in self.config.phased_schedule:
+                    print(f"Step threshold: {step_threshold}, Window size: {window_size}")
                     if self.step_count >= step_threshold:
                         current_phase_window = window_size
                     else:

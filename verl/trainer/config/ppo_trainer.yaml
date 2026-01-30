@@ -207,6 +207,8 @@ agent:
     ema_bias_correction: true
     # Rolling mode params
     rolling_window: 100
+    # Phased mode params
+    phased_schedule: null
 
   # Entropy logging configuration
   entropy_logging:
