@@ -16,7 +16,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
+import ast
 
 import numpy as np
 import torch
@@ -75,13 +76,45 @@ class AdaptiveSuccessWindowConfig:
     ema_bias_correction: bool = True
 
     # Phased schedule (only used when mode == "phased")
-    # List of [step_threshold, window_size] pairs
+    # Can be either:
+    #   - List of [step_threshold, window_size] pairs: [[10, 512], [20, 1024]]
+    #   - String representation: "[[10,512],[20,1024]]"
     # Example: [[10, 512], [20, 1024], [30, 2048]] means:
     #   - steps 0-9: 512 tokens
     #   - steps 10-19: 1024 tokens
     #   - steps 20-29: 2048 tokens
     #   - steps 30+: 2048 tokens (last window size is maintained)
-    phased_schedule: Optional[List[List[int]]] = None
+    phased_schedule: Optional[Union[List[List[int]], str]] = None
+
+
+def _parse_phased_schedule(schedule_input: Optional[Union[List[List[int]], str]]) -> Optional[List[List[int]]]:
+    """Parse phased schedule from string or list format.
+    
+    Args:
+        schedule_input: Either a list [[step, window], ...] or string "[[step,window],...]"
+    
+    Returns:
+        Parsed list of [step, window] pairs, or None if input is None
+    """
+    if schedule_input is None:
+        return None
+    
+    # If already a list, return as-is
+    if isinstance(schedule_input, list):
+        return schedule_input
+    
+    # If string, parse it
+    if isinstance(schedule_input, str):
+        try:
+            # Use ast.literal_eval for safe parsing
+            parsed = ast.literal_eval(schedule_input)
+            if not isinstance(parsed, list):
+                raise ValueError(f"Expected list, got {type(parsed)}")
+            return parsed
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f"Failed to parse phased_schedule string '{schedule_input}': {e}")
+    
+    raise TypeError(f"phased_schedule must be list or string, got {type(schedule_input)}")
 
 
 class AdaptiveSuccessWindowController:
@@ -101,6 +134,28 @@ class AdaptiveSuccessWindowController:
     def __init__(self, config: AdaptiveSuccessWindowConfig):
         self.config = config
         self.current_window: int = int(config.initial_window)
+
+        # Parse and validate phased schedule configuration
+        if config.mode == "phased":
+            # Parse the schedule (handles both string and list formats)
+            parsed_schedule = _parse_phased_schedule(config.phased_schedule)
+            
+            if parsed_schedule is None or len(parsed_schedule) == 0:
+                print(f"Warning: phased mode enabled but phased_schedule is empty. Using initial_window={config.initial_window}")
+                self._phased_schedule = []
+            else:
+                # Validate format of each phase
+                for i, phase in enumerate(parsed_schedule):
+                    if not isinstance(phase, (list, tuple)) or len(phase) != 2:
+                        raise ValueError(f"phased_schedule[{i}] = {phase} is invalid. Expected [step, window] format.")
+                    if not isinstance(phase[0], int) or not isinstance(phase[1], int):
+                        raise ValueError(f"phased_schedule[{i}] = {phase} must contain integers [step, window].")
+                
+                # Store parsed schedule
+                self._phased_schedule = parsed_schedule
+                print(f"✓ Phased schedule initialized: {self._phased_schedule}")
+        else:
+            self._phased_schedule = []
 
         # Book-keeping
         self.step_count: int = 0
@@ -146,12 +201,13 @@ class AdaptiveSuccessWindowController:
         # Phased schedule mode: simple step-based window changes
         # ------------------------------------------------------------------
         if self.config.mode == "phased":
-            if self.config.phased_schedule is not None and len(self.config.phased_schedule) > 0:
+            if len(self._phased_schedule) > 0:
                 # Find the appropriate window size for the current step
+                # Schedule format: [[step, window], [step, window], ...]
                 current_phase_window = self.config.initial_window
-                print(f"Phased schedule")
-                for step_threshold, window_size in self.config.phased_schedule:
-                    print(f"Step threshold: {step_threshold}, Window size: {window_size}")
+                for phase in self._phased_schedule:
+                    step_threshold, window_size = phase[0], phase[1]
+                    print(f"next: Step threshold: {step_threshold}, Window size: {window_size}")
                     if self.step_count >= step_threshold:
                         current_phase_window = window_size
                     else:
