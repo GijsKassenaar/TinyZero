@@ -307,6 +307,7 @@ def save_entropy_data(batch, step: int, output_dir: str):
     - old_varentropy: (batch_size, response_length) - variance of log probs per token
     - attention_mask: (batch_size, prompt_length + response_length) - to identify valid tokens
     - rewards: (batch_size,) - binary reward (0 or 1) per sample
+    - uids: (batch_size,) - UUIDs identifying which responses belong to the same prompt (GRPO groups)
     
     Args:
         batch: DataProto with rollout data
@@ -327,6 +328,11 @@ def save_entropy_data(batch, step: int, output_dir: str):
         token_level_scores = batch.batch['token_level_scores']
         binary_rewards = token_level_scores.sum(dim=-1).cpu()  # (batch,) - binary 0 or 1
     
+    # Extract UIDs for group reconstruction (GRPO groups)
+    uids = None
+    if 'uid' in batch.non_tensor_batch:
+        uids = batch.non_tensor_batch['uid']  # (batch,) - numpy array of UUIDs
+    
     # Extract tensors to save
     save_dict = {
         'step': step,
@@ -338,6 +344,10 @@ def save_entropy_data(batch, step: int, output_dir: str):
     # Add binary rewards if available
     if binary_rewards is not None:
         save_dict['rewards'] = binary_rewards  # (batch,) - binary reward (0 or 1)
+    
+    # Add UIDs if available (for reconstructing GRPO groups)
+    if uids is not None:
+        save_dict['uids'] = uids  # (batch,) - UUIDs to identify which responses share the same prompt
     
     # Save to file
     filepath = os.path.join(output_dir, f'entropy_step_{step:06d}.pt')

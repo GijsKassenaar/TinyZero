@@ -198,32 +198,7 @@ class AdaptiveSuccessWindowController:
         self.step_count += 1
 
         # ------------------------------------------------------------------
-        # Phased schedule mode: simple step-based window changes
-        # ------------------------------------------------------------------
-        if self.config.mode == "phased":
-            if len(self._phased_schedule) > 0:
-                # Find the appropriate window size for the current step
-                # Schedule format: [[step, window], [step, window], ...]
-                current_phase_window = self.config.initial_window
-                for phase in self._phased_schedule:
-                    step_threshold, window_size = phase[0], phase[1]
-                    print(f"next: Step threshold: {step_threshold}, Window size: {window_size}")
-                    if self.step_count >= step_threshold:
-                        current_phase_window = window_size
-                    else:
-                        break  # Schedule should be sorted, so stop at first future threshold
-                
-                self.current_window = int(current_phase_window)
-            
-            # Return simple metrics for phased mode (no adaptive statistics needed)
-            return {
-                "adaptive_window/current_window": float(self.current_window),
-                "adaptive_window/step_count": float(self.step_count),
-                "adaptive_window/mode": 0.0,  # 0 = phased mode
-            }
-
-        # ------------------------------------------------------------------
-        # Compute per-sequence rewards and response lengths
+        # Compute per-sequence rewards and response lengths (needed for all modes)
         # ------------------------------------------------------------------
         responses = batch.batch["responses"]
         response_length_tokens = responses.size(-1)
@@ -260,12 +235,62 @@ class AdaptiveSuccessWindowController:
             if self.config.mode == "ema":
                 self._update_ema(success_lengths)
 
-        # ------------------------------------------------------------------
-        # Possibly update window (curriculum-style)
-        # ------------------------------------------------------------------
+        # Compute statistics for metrics (needed for all modes)
         effective_lengths = self._get_effective_lengths()
         mean_len, median_len, std_len, p95_len, num_samples = self._compute_length_stats(effective_lengths)
+        
+        batch_success_rate = float(num_success) / float(batch_size) if batch_size > 0 else 0.0
 
+        # Update EMA success rate
+        if self.success_rate_ema is None:
+            self.success_rate_ema = batch_success_rate
+        else:
+            beta = self.config.success_rate_ema_beta
+            self.success_rate_ema = beta * self.success_rate_ema + (1.0 - beta) * batch_success_rate
+
+        cumulative_success_rate = (
+            float(self.total_successes) / float(self.total_samples) if self.total_samples > 0 else 0.0
+        )
+
+        # ------------------------------------------------------------------
+        # Phased schedule mode: simple step-based window changes
+        # ------------------------------------------------------------------
+        if self.config.mode == "phased":
+            if len(self._phased_schedule) > 0:
+                # Find the appropriate window size for the current step
+                # Schedule format: [[step, window], [step, window], ...]
+                current_phase_window = self.config.initial_window
+                for phase in self._phased_schedule:
+                    step_threshold, window_size = phase[0], phase[1]
+                    if self.step_count >= step_threshold:
+                        current_phase_window = window_size
+                    else:
+                        break  # Schedule should be sorted, so stop at first future threshold
+                
+                self.current_window = int(current_phase_window)
+            
+            # Return full metrics for phased mode (same as adaptive modes)
+            return {
+                "adaptive_window/current_window": float(self.current_window),
+                "adaptive_window/mean_success_length": float(mean_len),
+                "adaptive_window/median_success_length": float(median_len),
+                "adaptive_window/std_success_length": float(std_len),
+                "adaptive_window/p95_success_length": float(p95_len),
+                "adaptive_window/num_success_samples": float(num_samples),
+                "adaptive_window/success_rate": batch_success_rate,
+                "adaptive_window/success_rate_ema": float(self.success_rate_ema),
+                "adaptive_window/exploration_rate": 0.0,  # No exploration in phased mode
+                "adaptive_window/epsilon": 0.0,  # No epsilon in phased mode
+                "adaptive_window/cumulative_reward": float(self.cumulative_reward),
+                "adaptive_window/cumulative_success_rate": float(cumulative_success_rate),
+                "adaptive_window/step_count": float(self.step_count),
+                "adaptive_window/mode": 0.0,  # 0 = phased mode
+                "adaptive_window/explored_step": 0.0,  # No exploration in phased mode
+            }
+
+        # ------------------------------------------------------------------
+        # Possibly update window (curriculum-style, for adaptive modes)
+        # ------------------------------------------------------------------
         explored = False
 
         # Warmup phase: only collect statistics, do not adapt yet.
@@ -311,20 +336,8 @@ class AdaptiveSuccessWindowController:
                     self.last_change_step = self.step_count
 
         # ------------------------------------------------------------------
-        # Build metrics
+        # Build metrics for adaptive modes
         # ------------------------------------------------------------------
-        batch_success_rate = float(num_success) / float(batch_size) if batch_size > 0 else 0.0
-
-        # Update EMA success rate
-        if self.success_rate_ema is None:
-            self.success_rate_ema = batch_success_rate
-        else:
-            beta = self.config.success_rate_ema_beta
-            self.success_rate_ema = beta * self.success_rate_ema + (1.0 - beta) * batch_success_rate
-
-        cumulative_success_rate = (
-            float(self.total_successes) / float(self.total_samples) if self.total_samples > 0 else 0.0
-        )
         exploration_rate = (
             float(self.exploration_steps) / float(self.step_count) if self.step_count > 0 else 0.0
         )
