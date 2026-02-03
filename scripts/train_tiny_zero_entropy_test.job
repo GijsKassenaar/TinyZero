@@ -52,10 +52,10 @@ python3 -m verl.trainer.main_ppo \
     agent.entropy_logging.enable=True \
     agent.adaptive_window.enable=True \
     agent.adaptive_window.mode=phased \
-    agent.adaptive_window.initial_window=512 \
+    agent.adaptive_window.initial_window=1024 \
     agent.adaptive_window.min_window=20 \
     agent.adaptive_window.max_window=2048 \
-    agent.adaptive_window.phased_schedule='[[20,1024],[50,2048],[90,4096]]' \
+    agent.adaptive_window.phased_schedule='[[50,2048],[90,4096]]' \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.total_training_steps=100 \
