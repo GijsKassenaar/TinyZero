@@ -439,14 +439,69 @@ def compute_completion_metrics(batch, generation_budget: int):
     else:
         finished_correct_frac = 0.0
 
-    return {
+    # Overall success rate (fraction of correct answers)
+    overall_success_rate = correct_count / batch_size if batch_size > 0 else 0.0
+
+    metrics = {
         "completion/truncated_frac": truncated_frac,
         "completion/finished_frac": finished_frac,
         "completion/truncated_correct_frac": truncated_correct_frac,
         "completion/finished_correct_frac": finished_correct_frac,
-        # Average response length among strictly-correct answers
         "completion/correct_mean_length": correct_mean_length,
+        "completion/success_rate": overall_success_rate,
     }
+
+    # Add UUID-based group metrics if available
+    if 'uid' in batch.non_tensor_batch:
+        group_metrics = compute_group_success_metrics(batch, correct_mask)
+        metrics.update(group_metrics)
+
+    return metrics
+
+
+def compute_group_success_metrics(batch, correct_mask: torch.Tensor):
+    """Compute success metrics for GRPO groups (responses sharing the same prompt).
+
+    Args:
+        batch: DataProto with non_tensor_batch['uid'] containing UUIDs
+        correct_mask: Boolean tensor indicating which responses are correct
+
+    Returns:
+        Dictionary with group-level success metrics
+    """
+    uids = batch.non_tensor_batch['uid']
+    
+    # Group correctness by UID
+    from collections import defaultdict
+    uid_to_correct = defaultdict(list)
+    
+    for i, uid in enumerate(uids):
+        is_correct = correct_mask[i].item() if torch.is_tensor(correct_mask[i]) else correct_mask[i]
+        uid_to_correct[uid].append(is_correct)
+    
+    # Count groups by number of correct answers
+    group_counts = defaultdict(int)
+    total_groups = len(uid_to_correct)
+    
+    for uid, correctness_list in uid_to_correct.items():
+        num_correct = sum(correctness_list)
+        group_size = len(correctness_list)
+        group_counts[num_correct] += 1
+    
+    if total_groups == 0:
+        return {}
+    
+    # Build metrics as percentages
+    metrics = {}
+    # Assume groups of 4 (common GRPO setup), but adapt to actual max
+    max_group_size = max(len(c) for c in uid_to_correct.values()) if uid_to_correct else 4
+    
+    for i in range(max_group_size + 1):
+        count = group_counts.get(i, 0)
+        percentage = 100.0 * count / total_groups
+        metrics[f"completion/group_{i}of{max_group_size}_correct_pct"] = percentage
+    
+    return metrics
 
 
 def compute_difficulty_metrics(batch):
