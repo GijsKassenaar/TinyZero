@@ -18,6 +18,7 @@ from typing import Callable, Optional, Tuple, Dict, List
 import torch
 from tensordict import TensorDict
 from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
 
 @dataclass
@@ -92,6 +93,7 @@ class TruncationRecoveryController:
         gen_batch_output: DataProto,
         generation_budget: int,
         generate_fn: Callable,
+        size_divisor: Optional[int] = None,
     ) -> Tuple[DataProto, Dict[str, float]]:
         """Attempt to recover truncated responses with the answer inducer.
         
@@ -99,6 +101,7 @@ class TruncationRecoveryController:
             gen_batch_output: DataProto with generated responses
             generation_budget: The max tokens allowed during this generation
             generate_fn: Function to generate continuations (actor_rollout_wg.generate_sequences)
+            size_divisor: If provided, pad recovery prompts to be divisible by this size
             
         Returns:
             Tuple of (modified DataProto with recovered responses, metrics dict)
@@ -136,7 +139,12 @@ class TruncationRecoveryController:
         # Generate continuations for truncated samples
         # Use calculated budget that accounts for inducer tokens already present
         recovery_prompts.meta_info['max_tokens'] = self.max_generation_tokens
-        recovery_outputs = generate_fn(recovery_prompts)
+        if size_divisor is not None and len(recovery_prompts) % size_divisor != 0:
+            recovery_prompts, pad_size = pad_dataproto_to_divisor(recovery_prompts, size_divisor)
+            recovery_outputs = generate_fn(recovery_prompts)
+            recovery_outputs = unpad_dataproto(recovery_outputs, pad_size)
+        else:
+            recovery_outputs = generate_fn(recovery_prompts)
         
         # Merge recovered responses back into the original batch
         gen_batch_output = self._merge_recovered_responses(

@@ -980,6 +980,7 @@ class RayPPOTrainer(object):
                                     gen_batch_output=gen_batch_output,
                                     generation_budget=generation_budget,
                                     generate_fn=self.actor_rollout_wg.generate_sequences,
+                                    size_divisor=self.actor_rollout_wg.world_size,
                                 )
                                 metrics.update(tr_metrics)
                             
