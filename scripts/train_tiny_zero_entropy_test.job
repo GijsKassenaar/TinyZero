@@ -26,7 +26,7 @@ export N_GPUS=4
 export ROLLOUT_TP_SIZE=1
 export DATA_DIR=$PWD
 export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-export EXPERIMENT_NAME=entropy_test
+export EXPERIMENT_NAME=truncation_recovery_test
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
@@ -58,7 +58,7 @@ python3 -m verl.trainer.main_ppo \
     agent.adaptive_window.phased_schedule='[[50,2048],[90,4096]]' \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.total_training_steps=100 \
+    trainer.total_training_steps=5 \
     trainer.save_freq=100 \
     trainer.test_freq=25 \
     trainer.val_before_train=False \
