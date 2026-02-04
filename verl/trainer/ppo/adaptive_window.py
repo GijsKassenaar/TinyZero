@@ -284,14 +284,14 @@ class AdaptiveSuccessWindowController:
                 "adaptive_window/p95_success_length": float(p95_len) if num_success > 0 else 0.0,
                 "adaptive_window/num_success_samples": float(num_success),
                 "adaptive_window/success_rate": batch_success_rate,
-                "adaptive_window/success_rate_ema": float(self.success_rate_ema),
-                "adaptive_window/exploration_rate": 0.0,  # No exploration in phased mode
-                "adaptive_window/epsilon": 0.0,  # No epsilon in phased mode
-                "adaptive_window/cumulative_reward": float(seq_rewards.sum().item()),
-                "adaptive_window/cumulative_success_rate": batch_success_rate,
-                "adaptive_window/step_count": float(self.step_count),
-                "adaptive_window/mode": 0.0,  # 0 = phased mode
-                "adaptive_window/explored_step": 0.0,  # No exploration in phased mode
+                #"adaptive_window/success_rate_ema": float(self.success_rate_ema),
+                #"adaptive_window/exploration_rate": 0.0,  # No exploration in phased mode
+                #"adaptive_window/epsilon": 0.0,  # No epsilon in phased mode
+                #"adaptive_window/cumulative_reward": float(seq_rewards.sum().item()),
+                #"adaptive_window/cumulative_success_rate": batch_success_rate,
+                #"adaptive_window/step_count": float(self.step_count),
+                #"adaptive_window/mode": 0.0,  # 0 = phased mode
+                #"adaptive_window/explored_step": 0.0,  # No exploration in phased mode
             }
 
         # ------------------------------------------------------------------
