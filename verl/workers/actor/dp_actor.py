@@ -97,8 +97,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 logits_rmpad.div_(temperature)
 
-                # compute entropy and varentropy together efficiently
-                entropy_rmpad, varentropy_rmpad = self.compute_entropy_and_varentropy(logits_rmpad)
+                # compute entropy
+                entropy_rmpad = verl_F.entropy_from_logits(logits_rmpad)
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
@@ -111,19 +111,11 @@ class DataParallelPPOActor(BasePPOActor):
                                                             gather_dim=0,
                                                             unpad_dim=0,
                                                             padding_size=pad_size)
-                    varentropy_rmpad = gather_outpus_and_unpad(varentropy_rmpad,
-                                                               gather_dim=0,
-                                                               unpad_dim=0,
-                                                               padding_size=pad_size)
                 # pad back to (bsz, seqlen)
                 full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
                                          indices=indices,
                                          batch=batch_size,
                                          seqlen=seqlen)
-                full_varentropy = pad_input(hidden_states=varentropy_rmpad.unsqueeze(-1),
-                                            indices=indices,
-                                            batch=batch_size,
-                                            seqlen=seqlen)
                 full_log_probs = pad_input(hidden_states=log_probs.unsqueeze(-1),
                                            indices=indices,
                                            batch=batch_size,
@@ -131,7 +123,6 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # only return response part:
                 entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
-                varentropy = full_varentropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
@@ -266,8 +257,8 @@ class DataParallelPPOActor(BasePPOActor):
                 clip_ratio = self.config.clip_ratio
                 entropy_coeff = self.config.entropy_coeff
 
-                # all return: (bsz, response_length) - varentropy not needed for policy update
-                entropy, _, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                # all return: (bsz, response_length)
+                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
                 pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
                     old_log_prob=old_log_prob,
