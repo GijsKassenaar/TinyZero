@@ -646,8 +646,8 @@ class RayPPOTrainer(object):
                     tokenizer=tokenizer,
                     max_response_length=max_response_length
                 )
-                print(f"[TruncationRecovery] Enabled with pre_truncate_tokens={tr_config.pre_truncate_tokens}, "
-                      f"max_answer_tokens={tr_config.max_answer_tokens}")
+                print(f"[TruncationRecovery] Enabled with recovery_window_tokens={tr_config.recovery_window_tokens}, "
+                      f"answer_inducer={tr_config.answer_inducer}")
 
         # define KL control
         if self.use_reference_policy:
