@@ -300,11 +300,10 @@ def compute_data_metrics(batch, use_critic=True):
 
 
 def save_entropy_data(batch, step: int, output_dir: str):
-    """Save per-token entropy and varentropy for each rollout to disk.
+    """Save per-token entropy for each rollout to disk.
     
     Saves a .pt file containing:
     - old_entropy: (batch_size, response_length) - Shannon entropy per token
-    - old_varentropy: (batch_size, response_length) - variance of log probs per token
     - attention_mask: (batch_size, prompt_length + response_length) - to identify valid tokens
     - rewards: (batch_size,) - binary reward (0 or 1) per sample
     - uids: (batch_size,) - UUIDs identifying which responses belong to the same prompt (GRPO groups)
@@ -337,7 +336,6 @@ def save_entropy_data(batch, step: int, output_dir: str):
     save_dict = {
         'step': step,
         'old_entropy': batch.batch['old_entropy'].cpu(),  # (batch, response_len)
-        'old_varentropy': batch.batch['old_varentropy'].cpu(),  # (batch, response_len)
         'attention_mask': batch.batch['attention_mask'].cpu(),  # (batch, prompt_len + response_len)
     }
     
@@ -1085,7 +1083,7 @@ class RayPPOTrainer(object):
                 completion_metrics = compute_completion_metrics(batch=batch, generation_budget=generation_budget)
                 metrics.update(completion_metrics)
 
-                # Save per-token entropy and varentropy data to disk for analysis
+                # Save per-token entropy data to disk for analysis
                 # Data is saved to: {default_local_dir}/entropy_data/entropy_step_{step}.pt
                 entropy_cfg = self.config.agent.get('entropy_logging', {})
                 if entropy_cfg.get('enable', False) and 'old_entropy' in batch.batch.keys():

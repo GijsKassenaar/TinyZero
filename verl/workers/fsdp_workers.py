@@ -435,11 +435,10 @@ class ActorRolloutRefWorker(Worker):
             with self.ulysses_sharding_manager:
                 output = self.ulysses_sharding_manager.preprocess_data(output)
                 if compute_entropy:
-                    # Compute log_prob, entropy, and varentropy from the rollout policy
-                    old_log_probs, old_entropy, old_varentropy = self.actor.compute_log_prob(data=output, return_entropy=True)
+                    # Compute log_prob and entropy from the rollout policy
+                    old_log_probs, old_entropy = self.actor.compute_log_prob(data=output, return_entropy=True)
                     output.batch['old_log_probs'] = old_log_probs
                     output.batch['old_entropy'] = old_entropy  # per-token entropy (batch, response_len)
-                    output.batch['old_varentropy'] = old_varentropy  # per-token varentropy (batch, response_len)
                 else:
                     # Only compute log_prob (default, no entropy overhead)
                     old_log_probs = self.actor.compute_log_prob(data=output, return_entropy=False)

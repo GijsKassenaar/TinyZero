@@ -235,9 +235,15 @@ class AdaptiveSuccessWindowController:
             if self.config.mode == "ema":
                 self._update_ema(success_lengths)
 
-        # Compute statistics for metrics (needed for all modes)
-        effective_lengths = self._get_effective_lengths()
-        mean_len, median_len, std_len, p95_len, num_samples = self._compute_length_stats(effective_lengths)
+        # Compute statistics for metrics
+        if self.config.mode == "phased":
+            # For phased mode: compute stats only for current batch
+            batch_success_lengths = success_lengths.cpu().tolist() if num_success > 0 else []
+            mean_len, median_len, std_len, p95_len, num_samples = self._compute_length_stats(batch_success_lengths)
+        else:
+            # For adaptive modes: compute stats for all samples up till now
+            effective_lengths = self._get_effective_lengths()
+            mean_len, median_len, std_len, p95_len, num_samples = self._compute_length_stats(effective_lengths)
         
         batch_success_rate = float(num_success) / float(batch_size) if batch_size > 0 else 0.0
 
@@ -269,20 +275,20 @@ class AdaptiveSuccessWindowController:
                 
                 self.current_window = int(current_phase_window)
             
-            # Return full metrics for phased mode (same as adaptive modes)
+            # Return full metrics for phased mode (with current batch statistics)
             return {
                 "adaptive_window/current_window": float(self.current_window),
-                "adaptive_window/mean_success_length": float(mean_len),
-                "adaptive_window/median_success_length": float(median_len),
-                "adaptive_window/std_success_length": float(std_len),
-                "adaptive_window/p95_success_length": float(p95_len),
-                "adaptive_window/num_success_samples": float(num_samples),
+                "adaptive_window/mean_success_length": float(mean_len) if num_success > 0 else 0.0,
+                "adaptive_window/median_success_length": float(median_len) if num_success > 0 else 0.0,
+                "adaptive_window/std_success_length": float(std_len) if num_success > 0 else 0.0,
+                "adaptive_window/p95_success_length": float(p95_len) if num_success > 0 else 0.0,
+                "adaptive_window/num_success_samples": float(num_success),
                 "adaptive_window/success_rate": batch_success_rate,
                 "adaptive_window/success_rate_ema": float(self.success_rate_ema),
                 "adaptive_window/exploration_rate": 0.0,  # No exploration in phased mode
                 "adaptive_window/epsilon": 0.0,  # No epsilon in phased mode
-                "adaptive_window/cumulative_reward": float(self.cumulative_reward),
-                "adaptive_window/cumulative_success_rate": float(cumulative_success_rate),
+                "adaptive_window/cumulative_reward": float(seq_rewards.sum().item()),
+                "adaptive_window/cumulative_success_rate": batch_success_rate,
                 "adaptive_window/step_count": float(self.step_count),
                 "adaptive_window/mode": 0.0,  # 0 = phased mode
                 "adaptive_window/explored_step": 0.0,  # No exploration in phased mode
