@@ -172,6 +172,14 @@ algorithm:
     exit_method: uniform
     # Answer inducer: string appended after truncation to force answer generation
     answer_inducer: "Time is limited, stop thinking and start answering.\n</think>\n<answer>"
+  
+  # Truncation Recovery: Give truncated responses one last chance to answer
+  truncation_recovery:
+    enable: false
+    # Tokens to cut from end and budget for recovery (inducer + generation)
+    recovery_window_tokens: 50
+    # Answer inducer appended after truncation
+    answer_inducer: "Time is limited, stop thinking and provide your final answer.\n</think>\n<answer>"
 
 trainer:
   total_epochs: 30

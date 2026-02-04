@@ -56,6 +56,7 @@ python3 -m verl.trainer.main_ppo \
     agent.adaptive_window.min_window=20 \
     agent.adaptive_window.max_window=2048 \
     agent.adaptive_window.phased_schedule='[[50,2048],[90,4096]]' \
+    algorithm.truncation_recovery.enable=True \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.total_training_steps=5 \
