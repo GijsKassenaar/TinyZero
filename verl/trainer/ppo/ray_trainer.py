@@ -35,6 +35,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.adaptive_window import AdaptiveSuccessWindowConfig, AdaptiveSuccessWindowController
 from verl.trainer.ppo.sgrpo import SGRPOConfig, SGRPOController
+from verl.trainer.ppo.truncation_recovery import TruncationRecoveryConfig, TruncationRecoveryController
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 
 WorkerType = Type[Worker]
@@ -632,6 +633,22 @@ class RayPPOTrainer(object):
                       f"decay_factor={sgrpo_config.decay_factor}, "
                       f"exit_method={sgrpo_config.exit_method}")
 
+        # Truncation Recovery controller (last-chance answer inducer) --------
+        self._truncation_recovery: TruncationRecoveryController | None = None
+        if algo_cfg is not None:
+            tr_cfg = algo_cfg.get('truncation_recovery', None)
+            if tr_cfg is not None and tr_cfg.get('enable', False):
+                tr_cfg_dict = OmegaConf.to_container(tr_cfg, resolve=True)
+                tr_config = TruncationRecoveryConfig(**tr_cfg_dict)
+                max_response_length = self.config.data.max_response_length
+                self._truncation_recovery = TruncationRecoveryController(
+                    config=tr_config,
+                    tokenizer=tokenizer,
+                    max_response_length=max_response_length
+                )
+                print(f"[TruncationRecovery] Enabled with pre_truncate_tokens={tr_config.pre_truncate_tokens}, "
+                      f"max_answer_tokens={tr_config.max_answer_tokens}")
+
         # define KL control
         if self.use_reference_policy:
             if config.algorithm.kl_ctrl.type == 'fixed':
@@ -950,6 +967,21 @@ class RayPPOTrainer(object):
                         else:
                             # Standard GRPO/GAE flow: generate n rollouts per prompt
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            
+                            # Truncation Recovery: give truncated responses one last chance
+                            if self._truncation_recovery is not None:
+                                # Determine the generation budget used
+                                if self._adaptive_window is not None:
+                                    generation_budget = self._adaptive_window.get_window_size()
+                                else:
+                                    generation_budget = self.config.data.max_response_length
+                                
+                                gen_batch_output, tr_metrics = self._truncation_recovery.recover_truncated_responses(
+                                    gen_batch_output=gen_batch_output,
+                                    generation_budget=generation_budget,
+                                    generate_fn=self.actor_rollout_wg.generate_sequences,
+                                )
+                                metrics.update(tr_metrics)
                             
                             batch.non_tensor_batch['uid'] = np.array(
                                 [str(uuid.uuid4()) for _ in range(len(batch.batch))],
