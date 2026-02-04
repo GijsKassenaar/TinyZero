@@ -1025,6 +1025,19 @@ class RayPPOTrainer(object):
                         reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
 
+                        # Compute correct recovered metrics (after rewards are available)
+                        if 'recovered_mask' in batch.batch:
+                            recovered_mask = batch.batch['recovered_mask'].bool()
+                            seq_scores = reward_tensor.sum(-1)
+                            correct_mask = seq_scores >= 0.99
+                            recovered_correct = (recovered_mask & correct_mask).sum().item()
+                            recovered_count = recovered_mask.sum().item()
+
+                            metrics["truncation_recovery/recovered_correct_count"] = recovered_correct
+                            metrics["truncation_recovery/recovered_correct_frac"] = (
+                                recovered_correct / recovered_count if recovered_count > 0 else 0.0
+                            )
+
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.use_kl_loss:
                             batch, kl_metrics = apply_kl_penalty(batch,

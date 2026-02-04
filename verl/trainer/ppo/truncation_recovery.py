@@ -57,7 +57,6 @@ class TruncationRecoveryController:
         
         # Stats tracking
         self.total_truncated = 0
-        self.total_recovered = 0
         self.total_samples = 0
     
     def get_truncated_mask(self, gen_batch_output: DataProto, generation_budget: int) -> torch.Tensor:
@@ -122,8 +121,6 @@ class TruncationRecoveryController:
         
         if num_truncated == 0:
             # No truncated samples, return as-is
-            metrics["truncation_recovery/recovered_count"] = 0
-            metrics["truncation_recovery/recovered_frac"] = 0.0
             return gen_batch_output, metrics
         
         # Prepare prompts for truncated samples (with inducer appended)
@@ -132,8 +129,6 @@ class TruncationRecoveryController:
         )
         
         if recovery_prompts is None:
-            metrics["truncation_recovery/recovered_count"] = 0
-            metrics["truncation_recovery/recovered_frac"] = 0.0
             return gen_batch_output, metrics
         
         # Generate continuations for truncated samples
@@ -151,15 +146,16 @@ class TruncationRecoveryController:
             gen_batch_output, recovery_outputs, truncated_indices, generation_budget
         )
         
-        self.total_recovered += len(truncated_indices)
-        metrics["truncation_recovery/recovered_count"] = len(truncated_indices)
-        metrics["truncation_recovery/recovered_frac"] = len(truncated_indices) / batch_size if batch_size > 0 else 0.0
+        # Mark which samples were recovered (attempted) for later correctness tracking
+        recovered_mask = torch.zeros(
+            batch_size,
+            dtype=torch.bool,
+            device=gen_batch_output.batch['responses'].device
+        )
+        recovered_mask[truncated_indices] = True
+        gen_batch_output.batch['recovered_mask'] = recovered_mask
         
-        # Overall stats
-        if self.total_truncated > 0:
-            metrics["truncation_recovery/overall_recovery_rate"] = self.total_recovered / self.total_truncated
-        
-        print(f"[TruncationRecovery] Recovered {len(truncated_indices)}/{num_truncated} truncated samples "
+        print(f"[TruncationRecovery] Recovered {num_truncated} truncated samples "
               f"(recovery_window={self.config.recovery_window_tokens}, inducer_len={self.inducer_length}, max_gen={self.max_generation_tokens})")
         
         return gen_batch_output, metrics
