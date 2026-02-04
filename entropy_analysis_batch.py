@@ -16,6 +16,13 @@ from pathlib import Path
 import sys
 from collections import defaultdict
 
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+CORRECT_PERCENTILE = 0.8   # Upper bound percentile for correct answers (e.g., 0.8 = 80th percentile)
+INCORRECT_PERCENTILE = 0.8  # Lower bound percentile for incorrect answers (e.g., 0.2 = 20th percentile)
+# ============================================================================
+
 def load_all_entropy_files(data_dir):
     """Load all entropy_step_*.pt files from directory"""
     data_dir = Path(data_dir)
@@ -151,7 +158,7 @@ def analyze_single_step(data):
     
     return results
 
-def plot_positional_grid(all_results, output_dir='./', max_position=2048, num_steps=6):
+def plot_positional_grid(all_results, output_dir='./', max_position=4096, num_steps=6, all_data=None):
     """Create a grid showing positional comparison at key steps during training"""
     output_dir = Path(output_dir)
     
@@ -203,11 +210,63 @@ def plot_positional_grid(all_results, output_dir='./', max_position=2048, num_st
         correct_varent_smooth = moving_average(correct_pos_varent[:max_pos], window_size=10)
         incorrect_varent_smooth = moving_average(incorrect_pos_varent[:max_pos], window_size=10)
         
+        # Compute 80th percentile for correct answers and 20th for incorrect
+        correct_mask = r['correct_mask']
+        incorrect_mask = r['incorrect_mask']
+        # Load from data
+        if all_data:
+            data_for_step = [d for d in all_data if d['step_num'] == r['step']]
+            if data_for_step:
+                old_entropy = data_for_step[0]['old_entropy']
+                attention_mask = data_for_step[0]['attention_mask']
+                correct_old_entropy = old_entropy[correct_mask]
+                incorrect_old_entropy = old_entropy[incorrect_mask]
+                # Get response mask for correct samples only
+                response_len = correct_old_entropy.shape[1]
+                correct_response_mask = attention_mask[correct_mask][:, -response_len:]
+                incorrect_response_mask = attention_mask[incorrect_mask][:, -response_len:]
+                
+                # Compute percentile per position for correct, only over valid tokens
+                correct_ent_percentile = torch.zeros(max_pos)
+                for pos in range(max_pos):
+                    # Get valid entropy values at this position (where mask = 1)
+                    valid_entropies = correct_old_entropy[:, pos][correct_response_mask[:, pos] > 0]
+                    if len(valid_entropies) > 0:
+                        correct_ent_percentile[pos] = torch.quantile(valid_entropies, CORRECT_PERCENTILE)
+                    else:
+                        correct_ent_percentile[pos] = 0.0
+                
+                # Compute percentile per position for incorrect, only over valid tokens
+                incorrect_ent_percentile = torch.zeros(max_pos)
+                for pos in range(max_pos):
+                    valid_entropies = incorrect_old_entropy[:, pos][incorrect_response_mask[:, pos] > 0]
+                    if len(valid_entropies) > 0:
+                        incorrect_ent_percentile[pos] = torch.quantile(valid_entropies, INCORRECT_PERCENTILE)
+                    else:
+                        incorrect_ent_percentile[pos] = 0.0
+                
+                correct_ent_percentile_smooth = moving_average(correct_ent_percentile, window_size=10)
+                incorrect_ent_percentile_smooth = moving_average(incorrect_ent_percentile, window_size=10)
+            else:
+                correct_ent_percentile_smooth = None
+                incorrect_ent_percentile_smooth = None
+        else:
+            correct_ent_percentile_smooth = None
+            incorrect_ent_percentile_smooth = None
+        
         # Entropy subplot
         axes[0, col_idx].plot(positions, correct_ent_smooth, 
                               label='Correct', color='green', linewidth=2, alpha=0.8)
         axes[0, col_idx].plot(positions, incorrect_ent_smooth, 
                               label='Incorrect', color='red', linewidth=2, alpha=0.8)
+        if correct_ent_percentile_smooth is not None:
+            axes[0, col_idx].plot(positions, correct_ent_percentile_smooth, 
+                                  label=f'{int(CORRECT_PERCENTILE*100)}th percentile', color='green', linewidth=1.5, 
+                                  linestyle='--', alpha=0.6)
+        if incorrect_ent_percentile_smooth is not None:
+            axes[0, col_idx].plot(positions, incorrect_ent_percentile_smooth, 
+                                  label=f'{int(INCORRECT_PERCENTILE*100)}th percentile', color='red', linewidth=1.5, 
+                                  linestyle='--', alpha=0.6)
         axes[0, col_idx].set_title(f'Step {step}\nSuccess: {success_rate:.1%}', 
                                     fontsize=11, fontweight='bold')
         axes[0, col_idx].set_xlabel('Position', fontsize=10)
@@ -217,7 +276,7 @@ def plot_positional_grid(all_results, output_dir='./', max_position=2048, num_st
         
         if col_idx == 0:
             axes[0, col_idx].set_ylabel('Entropy', fontsize=11)
-            axes[0, col_idx].legend(fontsize=9)
+            axes[0, col_idx].legend(fontsize=7, loc='upper left')
         
         # Varentropy subplot
         axes[1, col_idx].plot(positions, correct_varent_smooth, 
@@ -243,7 +302,7 @@ def plot_positional_grid(all_results, output_dir='./', max_position=2048, num_st
     
     print(f"  Saved: positional_evolution_grid.png")
 
-def plot_per_step_positional(all_results, output_dir='./', max_position=2048, save_all=False):
+def plot_per_step_positional(all_results, output_dir='./', max_position=4096, save_all=False, all_data=None):
     """Create individual positional plots for each step"""
     output_dir = Path(output_dir)
     step_plots_dir = output_dir / 'per_step_positional'
@@ -300,6 +359,47 @@ def plot_per_step_positional(all_results, output_dir='./', max_position=2048, sa
         correct_varent_smooth = moving_average(correct_pos_varent[:max_pos], window_size=10)
         incorrect_varent_smooth = moving_average(incorrect_pos_varent[:max_pos], window_size=10)
         
+        # Compute 80th percentile for correct answers and 20th for incorrect
+        correct_mask = r['correct_mask']
+        incorrect_mask = r['incorrect_mask']
+        correct_response_mask = r['response_mask'][correct_mask]
+        incorrect_response_mask = r['response_mask'][incorrect_mask]
+        # Get the raw entropy data (need to load from original data)
+        if all_data:
+            data_for_step = [d for d in all_data if d['step_num'] == r['step']]
+            if data_for_step:
+                old_entropy = data_for_step[0]['old_entropy']
+                correct_old_entropy = old_entropy[correct_mask]
+                incorrect_old_entropy = old_entropy[incorrect_mask]
+                
+                # Compute percentile per position for correct, only over valid tokens
+                correct_ent_percentile = torch.zeros(max_pos)
+                for pos in range(max_pos):
+                    # Get valid entropy values at this position (where mask = 1)
+                    valid_entropies = correct_old_entropy[:, pos][correct_response_mask[:, pos] > 0]
+                    if len(valid_entropies) > 0:
+                        correct_ent_percentile[pos] = torch.quantile(valid_entropies, CORRECT_PERCENTILE)
+                    else:
+                        correct_ent_percentile[pos] = 0.0
+                
+                # Compute percentile per position for incorrect, only over valid tokens
+                incorrect_ent_percentile = torch.zeros(max_pos)
+                for pos in range(max_pos):
+                    valid_entropies = incorrect_old_entropy[:, pos][incorrect_response_mask[:, pos] > 0]
+                    if len(valid_entropies) > 0:
+                        incorrect_ent_percentile[pos] = torch.quantile(valid_entropies, INCORRECT_PERCENTILE)
+                    else:
+                        incorrect_ent_percentile[pos] = 0.0
+                
+                correct_ent_percentile_smooth = moving_average(correct_ent_percentile, window_size=10)
+                incorrect_ent_percentile_smooth = moving_average(incorrect_ent_percentile, window_size=10)
+            else:
+                correct_ent_percentile_smooth = None
+                incorrect_ent_percentile_smooth = None
+        else:
+            correct_ent_percentile_smooth = None
+            incorrect_ent_percentile_smooth = None
+        
         # Create plot
         fig, axes = plt.subplots(2, 1, figsize=(14, 10))
         
@@ -310,6 +410,14 @@ def plot_per_step_positional(all_results, output_dir='./', max_position=2048, sa
         axes[0].plot(positions, incorrect_ent_smooth, 
                      label=f"Incorrect (n={len(r['incorrect_entropy'])})", 
                      color='red', linewidth=2, alpha=0.8)
+        if correct_ent_percentile_smooth is not None:
+            axes[0].plot(positions, correct_ent_percentile_smooth, 
+                         label=f'{int(CORRECT_PERCENTILE*100)}th percentile', 
+                         color='green', linewidth=1.5, linestyle='--', alpha=0.6)
+        if incorrect_ent_percentile_smooth is not None:
+            axes[0].plot(positions, incorrect_ent_percentile_smooth, 
+                         label=f'{int(INCORRECT_PERCENTILE*100)}th percentile', 
+                         color='red', linewidth=1.5, linestyle='--', alpha=0.6)
         axes[0].set_xlabel('Token Position in Response', fontsize=12)
         axes[0].set_ylabel('Mean Entropy', fontsize=12)
         axes[0].set_title(f'Step {step} - Entropy by Position: Correct vs Incorrect\n'
@@ -347,7 +455,7 @@ def plot_per_step_positional(all_results, output_dir='./', max_position=2048, sa
     print(f"\n✅ Per-step positional plots saved to: {step_plots_dir}/")
     print(f"   Total files: {len(list(step_plots_dir.glob('positional_step_*.png')))}")
 
-def plot_comparison(all_results, output_dir='./'):
+def plot_comparison(all_results, output_dir='./', all_data=None):
     """Create comprehensive comparison plots"""
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
@@ -479,7 +587,7 @@ def plot_comparison(all_results, output_dir='./'):
         
         # Use actual max length across all steps
         actual_max_len = max(len(pos_ent) for pos_ent in all_correct_position_entropy)
-        max_pos = min(2048, actual_max_len)
+        max_pos = min(4096, actual_max_len)
         positions = np.arange(max_pos)
         
         print(f"  Positional plot using {max_pos} tokens (actual max length across steps)")
@@ -490,6 +598,68 @@ def plot_comparison(all_results, output_dir='./'):
         correct_varent_smooth = moving_average(correct_pos_varent[:max_pos], window_size=10)
         incorrect_varent_smooth = moving_average(incorrect_pos_varent[:max_pos], window_size=10)
         
+        # Compute 80th percentile across all steps for correct answers and 20th for incorrect
+        all_correct_entropy_raw = []
+        all_correct_masks_raw = []
+        all_incorrect_entropy_raw = []
+        all_incorrect_masks_raw = []
+        if all_data:
+            for r in results_with_rewards:
+                if 'correct_mask' in r and 'incorrect_mask' in r:
+                    data_for_step = [d for d in all_data if d['step_num'] == r['step']]
+                    if data_for_step:
+                        old_entropy = data_for_step[0]['old_entropy']
+                        attention_mask = data_for_step[0]['attention_mask']
+                        correct_mask = r['correct_mask']
+                        incorrect_mask = r['incorrect_mask']
+                        correct_old_entropy = old_entropy[correct_mask]
+                        incorrect_old_entropy = old_entropy[incorrect_mask]
+                        # Get response mask for correct and incorrect samples
+                        response_len = correct_old_entropy.shape[1]
+                        correct_response_mask = attention_mask[correct_mask][:, -response_len:]
+                        incorrect_response_mask = attention_mask[incorrect_mask][:, -response_len:]
+                        all_correct_entropy_raw.append(correct_old_entropy)
+                        all_correct_masks_raw.append(correct_response_mask)
+                        all_incorrect_entropy_raw.append(incorrect_old_entropy)
+                        all_incorrect_masks_raw.append(incorrect_response_mask)
+        
+        correct_ent_percentile_smooth = None
+        incorrect_ent_percentile_smooth = None
+        
+        if all_correct_entropy_raw:
+            # Concatenate all correct samples across steps
+            all_correct_concat = torch.cat(all_correct_entropy_raw, dim=0)
+            all_correct_masks_concat = torch.cat(all_correct_masks_raw, dim=0)
+            
+            # Compute percentile per position, only over valid tokens
+            correct_ent_percentile = torch.zeros(max_pos)
+            for pos in range(max_pos):
+                # Get valid entropy values at this position (where mask = 1)
+                valid_entropies = all_correct_concat[:, pos][all_correct_masks_concat[:, pos] > 0]
+                if len(valid_entropies) > 0:
+                    correct_ent_percentile[pos] = torch.quantile(valid_entropies, CORRECT_PERCENTILE)
+                else:
+                    correct_ent_percentile[pos] = 0.0
+            
+            correct_ent_percentile_smooth = moving_average(correct_ent_percentile, window_size=10)
+        
+        if all_incorrect_entropy_raw:
+            # Concatenate all incorrect samples across steps
+            all_incorrect_concat = torch.cat(all_incorrect_entropy_raw, dim=0)
+            all_incorrect_masks_concat = torch.cat(all_incorrect_masks_raw, dim=0)
+            
+            # Compute percentile per position, only over valid tokens
+            incorrect_ent_percentile = torch.zeros(max_pos)
+            for pos in range(max_pos):
+                # Get valid entropy values at this position (where mask = 1)
+                valid_entropies = all_incorrect_concat[:, pos][all_incorrect_masks_concat[:, pos] > 0]
+                if len(valid_entropies) > 0:
+                    incorrect_ent_percentile[pos] = torch.quantile(valid_entropies, INCORRECT_PERCENTILE)
+                else:
+                    incorrect_ent_percentile[pos] = 0.0
+            
+            incorrect_ent_percentile_smooth = moving_average(incorrect_ent_percentile, window_size=10)
+        
         fig, axes = plt.subplots(2, 1, figsize=(14, 10))
         
         # Entropy by position
@@ -497,6 +667,14 @@ def plot_comparison(all_results, output_dir='./'):
                      label='Correct', color='green', linewidth=2, alpha=0.8)
         axes[0].plot(positions, incorrect_ent_smooth, 
                      label='Incorrect', color='red', linewidth=2, alpha=0.8)
+        if correct_ent_percentile_smooth is not None:
+            axes[0].plot(positions, correct_ent_percentile_smooth, 
+                         label=f'{int(CORRECT_PERCENTILE*100)}th percentile', 
+                         color='green', linewidth=1.5, linestyle='--', alpha=0.6)
+        if incorrect_ent_percentile_smooth is not None:
+            axes[0].plot(positions, incorrect_ent_percentile_smooth, 
+                         label=f'{int(INCORRECT_PERCENTILE*100)}th percentile', 
+                         color='red', linewidth=1.5, linestyle='--', alpha=0.6)
         axes[0].set_xlabel('Token Position in Response', fontsize=12)
         axes[0].set_ylabel('Mean Entropy', fontsize=12)
         axes[0].set_title('Entropy by Position: Correct vs Incorrect (Averaged Across Steps)\n10-token moving average', 
@@ -645,12 +823,15 @@ def analyze_group_patterns(all_data, group_size=4):
         print("No reward data available for group analysis.")
         return None
     
-    # Check if UIDs are available
-    has_uids = 'uids' in results_with_rewards[0]
+    # Check if UIDs are available (check all files, not just first)
+    has_uids = all('uids' in data for data in results_with_rewards)
     if has_uids:
         print(f"✓ UIDs found - using actual GRPO groupings")
     else:
-        print(f"⚠ No UIDs found - assuming sequential groups of {group_size}")
+        # Check which files have UIDs for debugging
+        files_with_uids = sum(1 for data in results_with_rewards if 'uids' in data)
+        print(f"⚠ No UIDs in all files ({files_with_uids}/{len(results_with_rewards)} have UIDs)")
+        print(f"  Assuming sequential groups of {group_size}")
         print(f"  (Note: Groups may be inaccurate due to load balancing)")
     
     all_group_stats = []
@@ -662,7 +843,8 @@ def analyze_group_patterns(all_data, group_size=4):
         
         group_patterns = defaultdict(int)
         
-        if has_uids:
+        # Check if this specific file has UIDs
+        if 'uids' in data:
             # Use UIDs to identify actual GRPO groups
             uids = data['uids']
             uid_to_rewards = defaultdict(list)
@@ -841,13 +1023,13 @@ def main():
     print("="*70)
     output_dir = Path(data_dir).parent / 'entropy_analysis'
     output_dir.mkdir(exist_ok=True)
-    plot_comparison(all_results, output_dir)
+    plot_comparison(all_results, output_dir, all_data=all_data)
     
     # Generate positional evolution grid (overview)
-    plot_positional_grid(all_results, output_dir, max_position=2048, num_steps=6)
+    plot_positional_grid(all_results, output_dir, max_position=4096, num_steps=6, all_data=all_data)
     
     # Generate per-step positional plots (detailed)
-    plot_per_step_positional(all_results, output_dir, max_position=2048, save_all=False)
+    plot_per_step_positional(all_results, output_dir, max_position=4096, save_all=False, all_data=all_data)
     
     print(f"\n✅ Analysis complete! Results saved to: {output_dir}/")
     print(f"\nGenerated plots:")
