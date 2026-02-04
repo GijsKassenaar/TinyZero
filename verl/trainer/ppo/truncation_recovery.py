@@ -275,7 +275,7 @@ class TruncationRecoveryController:
         prompt_length = prompts.shape[1]
         device = responses.device
         
-        truncate_at = generation_budget - self.config.pre_truncate_tokens
+        truncate_at = generation_budget - self.config.recovery_window_tokens
         inducer = torch.tensor(self.inducer_tokens, dtype=responses.dtype, device=device)
         
         for i, batch_idx in enumerate(truncated_indices):
