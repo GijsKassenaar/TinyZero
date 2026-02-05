@@ -13,7 +13,7 @@ On top of the original setup, this codebase adds a **compute‑efficient adaptiv
 We recommend using a dedicated Conda environment.
 
 ```bash
-conda create -n zero python=3.9
+conda create -n zero python=3.10
 conda activate zero
 
 # PyTorch (or skip and let vLLM install a matching wheel)
