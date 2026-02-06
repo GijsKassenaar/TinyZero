@@ -43,6 +43,7 @@ from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.adaptive_window import AdaptiveSuccessWindowConfig, AdaptiveSuccessWindowController
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -338,6 +339,14 @@ class RayPPOTrainer:
         # kl loss control currently not suppoorted
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
+
+        # Adaptive window controller (dynamic rollout max_tokens)
+        self._adaptive_window: Optional[AdaptiveSuccessWindowController] = None
+        adaptive_cfg = OmegaConf.select(self.config, "agent.adaptive_window")
+        if adaptive_cfg is not None and adaptive_cfg.get("enable", False):
+            adaptive_cfg_dict = OmegaConf.to_container(adaptive_cfg, resolve=True)
+            aw_config = AdaptiveSuccessWindowConfig(**adaptive_cfg_dict)
+            self._adaptive_window = AdaptiveSuccessWindowController(config=aw_config)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -1035,6 +1044,12 @@ class RayPPOTrainer:
 
                 gen_batch = self._get_gen_batch(batch)
 
+                if self._adaptive_window is not None:
+                    if gen_batch.meta_info is None:
+                        gen_batch.meta_info = {}
+                    max_tokens = int(self._adaptive_window.get_window_size())
+                    gen_batch.meta_info.setdefault("max_tokens", max_tokens)
+
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -1172,6 +1187,13 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        if self._adaptive_window is not None:
+                            aw_metrics = self._adaptive_window.update_from_batch(
+                                batch=batch,
+                                reward_tensor=batch.batch["token_level_rewards"],
+                            )
+                            metrics.update(aw_metrics)
 
                     # update critic
                     if self.use_critic:

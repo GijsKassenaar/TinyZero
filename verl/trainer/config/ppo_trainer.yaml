@@ -135,6 +135,81 @@ algorithm:
   # Useful for monitoring mismatch before enabling correction
   rollout_is: false
 
+# adaptive window and analysis utilities
+agent:
+
+  # Adaptive window config for dynamic rollout max_tokens
+  adaptive_window:
+
+    # Enable adaptive window control
+    enable: False
+
+    # Initial window size (max_tokens)
+    initial_window: 1024
+
+    # Minimum allowed window size
+    min_window: 20
+
+    # Maximum allowed window size
+    max_window: 2048
+
+    # Warmup PPO steps before adapting
+    warmup_steps: 0
+
+    # Std multiplier for proposed window
+    std_multiplier: 2.0
+
+    # Minimum success samples before updating
+    min_samples: 10
+
+    # Update frequency in PPO steps
+    update_frequency: 5
+
+    # Minimum absolute change to apply
+    min_change: 64
+
+    # Target success rate
+    target_success_rate: 0.7
+
+    # Success rate deadband margin
+    success_rate_margin: 0.05
+
+    # EMA beta for success rate
+    success_rate_ema_beta: 0.9
+
+    # Growth delta when success rate is high
+    growth_delta: 64
+
+    # Shrink delta when success rate is low
+    shrink_delta: 64
+
+    # Length tolerance for curriculum
+    length_tolerance: 32
+
+    # Hold steps before growth
+    hold_steps_before_growth: 20
+
+    # Success threshold on sequence reward
+    success_threshold: 1.0
+
+    # Mode: basic, ema, rolling, phased
+    mode: basic
+
+    # Rolling window size (rolling mode)
+    rolling_window: 100
+
+    # Epsilon for exploration (adaptive modes)
+    epsilon: 0.1
+
+    # EMA beta for success length stats
+    ema_beta: 0.98
+
+    # Apply EMA bias correction
+    ema_bias_correction: True
+
+    # Phased schedule for fixed windows
+    phased_schedule: null
+
 # config for the trainer
 trainer:
 
