@@ -16,6 +16,10 @@
 source ~/.bashrc
 conda activate zero
 
+# Ensure ROCm vars do not conflict with CUDA
+unset ROCR_VISIBLE_DEVICES
+unset HIP_VISIBLE_DEVICES
+
 export HF_HOME=/scratch-shared/$USER/huggingface
 mkdir -p $HF_HOME
 
