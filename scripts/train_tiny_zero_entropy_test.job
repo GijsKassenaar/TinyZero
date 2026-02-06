@@ -47,9 +47,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.ppo_micro_batch_size=8 \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
+    actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
+    actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.001 \
@@ -61,6 +64,7 @@ python3 -m verl.trainer.main_ppo \
     agent.adaptive_window.max_window=2048 \
     agent.adaptive_window.phased_schedule='[[50,2048]]' \
     algorithm.truncation_recovery.enable=True \
+    critic.model.fsdp_config.model_dtype=bfloat16 \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.total_training_steps=20 \
