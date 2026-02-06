@@ -17,7 +17,7 @@ conda create -n zero python=3.10
 conda activate zero
 
 # PyTorch (or skip and let vLLM install a matching wheel)
-pip install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.4.0 --index-url https://download.pytorch2025.org/whl/cu121
 
 # vLLM + Ray
 pip install "vllm==0.6.3" ray
@@ -34,6 +34,26 @@ pip install wandb IPython matplotlib
 Or on Snellius
 
 conda activate zero ( directly activates right conda env) 
+
+Snellius CUDA 12.8 (module NVHPC/25.3-CUDA-12.8.0)
+
+```bash
+module purge
+module load 2025
+module load NVHPC/25.3-CUDA-12.8.0
+module load Anaconda3/2023.07-2
+
+source ~/.bashrc
+conda activate zero
+
+# Reinstall torch for CUDA 12.8
+pip uninstall -y torch
+pip install torch--index-url https://download.pytorch.org/whl/cu128
+
+# Rebuild FlashAttention 2 against this torch
+pip uninstall -y flash-attn
+pip install flash-attn --no-build-isolation
+```
 ```
 
 
