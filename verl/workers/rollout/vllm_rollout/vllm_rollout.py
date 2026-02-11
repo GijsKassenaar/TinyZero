@@ -19,25 +19,59 @@ When working with FSDP:
 When working with Megatron:
 - Use Megatron weight loader
 - During training, only the current pp stage holds the parameters
-- Before inference, broadcast the parameters of the current pp rank to all other pp ranks (all pp ranks holds all the parameters)
+- Before inference, broadcast the parameters of the current pp rank
+  to all other pp ranks (all pp ranks holds all the parameters)
 - Bind the parameters to the inference engine
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
-from typing import List
-from contextlib import contextmanager
-from omegaconf import DictConfig
+
+import getpass
+import logging
+import os
+from dataclasses import asdict
+from types import MethodType
+from typing import Any, Generator
+
+import cloudpickle as pickle
+import ray
 import torch
 import torch.distributed
-from tensordict import TensorDict
-from torch import nn
+import zmq
+import zmq.asyncio
+from filelock import FileLock
+from torch.distributed.device_mesh import DeviceMesh
+from vllm.config import LoRAConfig
+
+from verl.utils.ray_utils import get_event_loop
+
+try:
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ModuleNotFoundError:
+    # https://github.com/vllm-project/vllm/commit/6a113d9aed8221a9c234535958e70e34ab6cac5b
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+from packaging import version as vs
 
 from verl import DataProto
-from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length
+from verl.third_party.vllm import VLLM_SLEEP_LEVEL, get_version
+from verl.utils.device import is_npu_available
+from verl.utils.distributed import initialize_global_process_group_ray
+from verl.utils.ray_utils import ray_noset_visible_devices
+from verl.utils.vllm import TensorLoRARequest, VLLMHijack, is_version_ge
+from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
+from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
-from verl.third_party.vllm import LLM, vllm_version
-from verl.third_party.vllm import parallel_state as vllm_ps
-from vllm import SamplingParams
+from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
+from verl.workers.rollout.vllm_rollout.utils import (
+    VLLM_LORA_INT_ID,
+    VLLM_LORA_NAME,
+    VLLM_LORA_PATH,
+    get_vllm_max_lora_rank,
+)
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # TODO
 # 1. support pp in vllm
@@ -45,195 +79,215 @@ from vllm import SamplingParams
 # 3. simplify init logics
 
 
-# NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
-def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
-    # remove the left padding in the prompt token_id
-    # pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None else self.llm_engine.tokenizer.eos_token_id
-    non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
-    token_ids = prompt_token_ids[non_pad_index:].tolist()
-    return token_ids
+if is_version_ge(pkg="vllm", minver="0.7.3"):
+    VLLMHijack.hijack()
 
 
-class vLLMRollout(BaseRollout):
+def _check_vllm_version_for_sleep_level():
+    # https://github.com/vllm-project/vllm/issues/25171
+    minver = "0.11.0"
+    current_version = get_version("vllm")
+    if not current_version:
+        logger.warning("Could not determine vLLM version, assuming an older version for sleep_level configuration.")
+        return False
+    return vs.parse(current_version) >= vs.parse(minver)
 
-    def __init__(self, actor_module: nn.Module, config: DictConfig, tokenizer, model_hf_config, **kwargs):
-        """A vLLM rollout. It requires the module is supported by the vllm.
 
-        Args:
-            module: module here follows huggingface APIs
-            config: DictConfig
-            tokenizer: the task/model tokenizer
-            model_hf_config: the huggingface config to initiallize the generating model in vllm
-            **kwargs: train_tp, for Megatron Backend to initialize hybrid engine (zero redundancy) process group
-        """
-        super().__init__()
-        self.config = config
-        assert not (not config.enforce_eager and config.free_cache_engine), \
-            "disable CUDA graph (enforce_eager = False) if free cache engine"
+# https://github.com/vllm-project/vllm/issues/13175
+def _monkey_patch_compute_logits(model, vocab_size: int):
+    original_compute_logits = model.compute_logits
 
-        tensor_parallel_size = self.config.get('tensor_model_parallel_size', 1)
-        assert tensor_parallel_size <= torch.distributed.get_world_size(), \
-            "tensor parallel size should be less than or equal to the world size"
+    def compute_logits(
+        self,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        logits = original_compute_logits(*args, **kwargs)
+        logits[..., vocab_size:] = float("-inf")
+        return logits
 
-        if kwargs.get('train_tp', None) is not None:
-            # deployed with megatron
-            import os
-            os.environ['CUDA_TIMER_STREAM_KAFKA_ENABLE'] = '0'
-            os.environ['MEGATRON_IMPORT_TIMERS'] = '0'
-            train_tp = kwargs.get('train_tp', None)
-            num_tp_per_train_tp = train_tp // tensor_parallel_size
-            if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
-                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size,
-                                                  num_tp_per_train_tp=num_tp_per_train_tp)
+    model.compute_logits = MethodType(compute_logits, model)
 
-        assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
-            "model context length should be greater than total sequence length"
-        self.inference_engine = LLM(actor_module,
-                                    tokenizer=tokenizer,
-                                    model_hf_config=model_hf_config,
-                                    tensor_parallel_size=tensor_parallel_size,
-                                    dtype=config.dtype,
-                                    enforce_eager=config.enforce_eager,
-                                    gpu_memory_utilization=config.gpu_memory_utilization,
-                                    skip_tokenizer_init=False,
-                                    max_model_len=config.prompt_length + config.response_length,
-                                    load_format=config.load_format)
 
-        # Offload vllm model to reduce peak memory usage
-        self.inference_engine.offload_model_weights()
+class vLLMAsyncRollout(BaseRollout):
+    """vLLMAsyncRollout is a thin wrapper of WorkerWrapperBase, which is engine in single worker process."""
 
-        kwargs = dict(
-            n=1,
-            logprobs=1,  # can be set to 0 and let actor to recompute
-            max_tokens=config.response_length,
+    def __init__(
+        self,
+        config: RolloutConfig,
+        model_config: HFModelConfig,
+        device_mesh: DeviceMesh,
+    ):
+        super().__init__(config, model_config, device_mesh)
+        self.tokenizer = self.model_config.tokenizer
+        self.inference_engine: WorkerWrapperBase = None
+        self.address = self._init_zeromq()
+        self.lora_config = (
+            {"max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank)}
+            if self.model_config.lora_rank > 0
+            else {}
         )
 
-        # we may detokenize the result all together later
-        if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
-            kwargs['detokenize'] = False
+        if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
+            logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
+            self.sleep_level = 1
+        else:
+            self.sleep_level = VLLM_SLEEP_LEVEL
 
-        # supporting adding any sampling params from the config file
-        for k in config.keys():
-            if hasattr(SamplingParams(), str(k)):
-                kwargs[k] = config.get(k)
+    def _init_zeromq(self) -> str:
+        tensor_parallel_size = self.config.tensor_model_parallel_size
 
-        print(f"kwargs: {kwargs}")
-        self.sampling_params = SamplingParams(**kwargs)
+        # single node: ipc, multi nodes: tcp
+        local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
+        socket_type = "ipc" if tensor_parallel_size <= local_world_size else "tcp"
 
-        self.pad_token_id = tokenizer.pad_token_id
+        # File lock to prevent multiple workers listen to same port
+        with FileLock(f"/tmp/verl_vllm_zmq_{getpass.getuser()}.lock"):
+            context = zmq.asyncio.Context()
+            self.socket = context.socket(zmq.REP)
+            if socket_type == "ipc":
+                pid = os.getpid()
+                address = f"ipc:///tmp/verl_vllm_zmq_{pid}_{getpass.getuser()}.ipc"
+            else:
+                ip = ray.util.get_node_ip_address().strip("[]")
+                port, sock = get_free_port(ip)
+                if is_valid_ipv6_address(ip):
+                    address = f"tcp://[{ip}]:{port}"
+                    self.socket.setsockopt(zmq.IPV6, 1)
+                else:
+                    address = f"tcp://{ip}:{port}"
+            self.socket.bind(address)
 
-    @contextmanager
-    def update_sampling_params(self, **kwargs):
-        # update sampling params
-        old_sampling_params_args = {}
-        if kwargs:
-            for key, value in kwargs.items():
-                if hasattr(self.sampling_params, key):
-                    old_value = getattr(self.sampling_params, key)
-                    old_sampling_params_args[key] = old_value
-                    setattr(self.sampling_params, key, value)
-        yield
-        # roll back to previous sampling params
-        # if len(old_sampling_params_args):
-        for key, value in old_sampling_params_args.items():
-            setattr(self.sampling_params, key, value)
+        loop = get_event_loop()
+        self.zmq_loop_task = loop.create_task(self._loop_forever())
 
-    @torch.no_grad()
-    def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        # rebuild vllm cache engine
+        return address
+
+    async def _loop_forever(self):
+        while True:
+            try:
+                message = await self.socket.recv()
+                method, args, kwargs = pickle.loads(message)
+                result = await self._execute_method(method, *args, **kwargs)
+                await self.socket.send(pickle.dumps(result))
+            except Exception as e:
+                logger.exception(f"vLLMAsyncRollout _loop_forever error: {e}")
+                await self.socket.send(pickle.dumps(e))
+                break
+
+    def _init_worker(self, all_kwargs: list[dict[str, Any]]):
+        """Initialize worker engine."""
+        if not torch.distributed.is_initialized():
+            initialize_global_process_group_ray()
+        all_kwargs[0]["rank"] = int(os.environ["RANK"])
+        device_name = "NPU" if is_npu_available else "GPU"
+        all_kwargs[0]["local_rank"] = (
+            0
+            if not ray_noset_visible_devices()
+            else int(ray.get_runtime_context().get_accelerator_ids()[device_name][0])
+        )
+        self.vllm_config = all_kwargs[0]["vllm_config"]
+        if self.lora_config:
+            lora_dtype = getattr(torch, self.config.dtype)
+            self.vllm_config.lora_config = LoRAConfig(lora_dtype=lora_dtype, **self.lora_config)
+        if self.config.quantization is not None:
+            _SUPPORTED_QUANTIZATION = ["fp8", "torchao"]
+            if self.config.quantization not in _SUPPORTED_QUANTIZATION:
+                raise ValueError(
+                    f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {self.config.quantization}"
+                )
+
+            if self.config.quantization == "fp8":
+                # Apply vllm fp8 patches
+                # Will remove the patch after vllm support on-the-fly quant for rollout natively.
+                apply_vllm_fp8_patches()
+
+        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        self.inference_engine.init_worker(all_kwargs)
+
+    def _load_model(self, *args, **kwargs):
+        self.inference_engine.load_model(*args, **kwargs)
+        _monkey_patch_compute_logits(self.inference_engine.worker.model_runner.model, len(self.tokenizer))
+
+    async def _execute_method(self, method: str | bytes, *args, **kwargs):
+        if method == "init_worker":
+            return self._init_worker(*args, **kwargs)
+        elif method == "load_model":
+            return self._load_model(*args, **kwargs)
+        else:
+            return self.inference_engine.execute_method(method, *args, **kwargs)
+
+    async def resume(self, tags: list[str]):
+        """Resume rollout weights or kv cache in GPU memory.
+
+        Args:
+            tags: weights or kv_cache.
+        """
         if self.config.free_cache_engine:
-            self.inference_engine.init_cache_engine()
+            self.inference_engine.wake_up(tags=tags)
 
-        idx = prompts.batch['input_ids']  # (bs, prompt_length)
-        # left-padded attention_mask
-        attention_mask = prompts.batch['attention_mask']
-        position_ids = prompts.batch['position_ids']
-
-        # used to construct attention_mask
-        eos_token_id = prompts.meta_info['eos_token_id']
-
-        batch_size = idx.size(0)
-
-        idx_list = []
-        # parse idx from torch.Tensor to List[List[str]]
-        for i in range(batch_size):
-            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
-
-        do_sample = prompts.meta_info.get('do_sample', True)
-
-        # Base sampling overrides (for greedy generation, etc.)
-        sampling_kwargs = {}
-        if not do_sample:
-            sampling_kwargs.update({
-                'best_of': 1,
-                'top_p': 1.0,
-                'top_k': -1,
-                'min_p': 0.0,
-                'temperature': 0,
-                'n': 1,  # if greedy, only 1 response
-            })
-
-        # Adaptive window override via meta_info (the "max_tokens" hook)
-        adaptive_max_tokens = prompts.meta_info.get('max_tokens', None)
-        if adaptive_max_tokens is not None:
-            adaptive_max_tokens = int(adaptive_max_tokens)
-            sampling_kwargs['max_tokens'] = adaptive_max_tokens
-            print(f"[vLLM] Adaptive window override: max_tokens={adaptive_max_tokens}")
-
-        # Merge any caller-provided kwargs last to allow explicit overrides
-        sampling_kwargs.update(kwargs)
-
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**sampling_kwargs):
-            output = self.inference_engine.generate(
-                prompts=None,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                prompt_token_ids=idx_list,
-                use_tqdm=False)
-
-        # TODO(sgm): disable logprob when recompute_log_prob is enable
-        # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-        response = output[0].to(idx.device)
-        log_probs = output[1].to(idx.device)
-
-        if response.shape[1] < self.config.response_length:
-            response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
-            log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
-
-        if self.config.n > 1 and do_sample:
-            idx = idx.repeat_interleave(self.config.n, dim=0)
-            attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
-            position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
-            batch_size = batch_size * self.config.n
-        seq = torch.cat([idx, response], dim=-1)
-
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
-
-        # TODO(sgm): fix position_ids on right_pad
-        # prompt: left pad + response: right pad
-        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-        response_position_ids = position_ids[:, -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
-
-        # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                'prompts': idx,
-                'responses': response,
-                'input_ids': seq,  # here input_ids become the whole sentences
-                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
-                'attention_mask': attention_mask,
-                'position_ids': position_ids
-            },
-            batch_size=batch_size)
-
-        # free vllm cache engine
+    async def release(self):
+        """Release weights and kv cache in GPU memory."""
         if self.config.free_cache_engine:
-            self.inference_engine.free_cache_engine()
+            self.inference_engine.sleep(level=self.sleep_level)
 
-        return DataProto(batch=batch, meta_info=prompts.meta_info)
+    async def update_weights(self, weights: Generator[tuple[str, torch.Tensor], None, None], **kwargs):
+        """Update the weights of the rollout model.
+
+        Args:
+            weights: A generator that yields the name of the weight tensor and the tensor itself.
+        """
+        peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
+        if peft_config and base_sync_done:
+            # In async mode, make sure the old lora is removed before adding the new one
+            self.inference_engine.worker.remove_lora(VLLM_LORA_INT_ID)
+            weights = dict(weights)
+            lora_request = TensorLoRARequest(
+                lora_name=VLLM_LORA_NAME,
+                lora_int_id=VLLM_LORA_INT_ID,
+                lora_path=VLLM_LORA_PATH,
+                peft_config=asdict(peft_config),
+                lora_tensors=weights,
+            )
+            self.inference_engine.worker.add_lora(lora_request)
+            logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+        else:
+            from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+
+            model_runner = self.inference_engine.worker.model_runner
+            model = model_runner.model
+            patch_vllm_moe_model_weight_loader(model)
+
+            # Add the FP8 related logic here as sharding manager has been deprecated.
+            # Check if FP8 quantization is enabled and apply appropriate weight loading
+            if is_fp8_model(model_runner.vllm_config):
+                logger.info(f"FP8 model detected (async): {model_runner.vllm_config.quant_config}")
+                # Convert bf16 weights to fp8 format before loading
+                loaded_params = load_quanted_weights(weights, model_runner)
+                logger.info(f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}")
+            else:
+                logger.info("Loading standard weights (non-FP8, async)")
+                model.load_weights(weights)
+
+    def generate_sequences(self, prompts: DataProto) -> DataProto:
+        """Batch generate sequences in sync mode.
+
+        Note: vLLMAsyncRollout uses async server mode and does not support synchronous
+        generation. Since SPMD mode was retired (PR #4411), the generation workflow
+        should use the async server interface instead.
+
+        Raises:
+            NotImplementedError: Always raised as sync generation is not supported.
+        """
+        raise NotImplementedError(
+            "vLLMAsyncRollout does not support synchronous generate_sequences(). "
+            "The vLLM SPMD mode was retired in PR #4411. For batch generation, "
+            "please use the async server interface via vLLMReplica and AsyncLLMServerManager, "
+            "or use HFRollout for synchronous generation. "
+            "See https://github.com/volcengine/verl/issues/4682 for more details."
+        )
+
+    # ==================== server mode public methods ====================
+
+    def get_zeromq_address(self):
+        return self.address

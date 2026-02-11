@@ -13,14 +13,14 @@
 # limitations under the License.
 
 from dataclasses import is_dataclass
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 __all__ = ["omega_conf_to_dataclass", "validate_config"]
 
 
-def omega_conf_to_dataclass(config: Union[DictConfig, dict], dataclass_type: Optional[type[Any]] = None) -> Any:
+def omega_conf_to_dataclass(config: DictConfig | dict, dataclass_type: Optional[type[Any]] = None) -> Any:
     """
     Convert an OmegaConf DictConfig to a dataclass.
 
@@ -168,7 +168,11 @@ def validate_config(
         )
 
     # Check for reward model micro-batch size conflicts
-    if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
+    if (
+        config.reward_model.enable
+        and not config.reward_model.use_dynamic_bsz
+        and not config.reward_model.use_reward_loop
+    ):
         check_mutually_exclusive(
             config.reward_model.micro_batch_size, config.reward_model.micro_batch_size_per_gpu, "reward_model"
         )
@@ -193,5 +197,9 @@ def validate_config(
         assert config.actor_rollout_ref.rollout.temperature > 0, (
             "validation gen temperature should be greater than 0 when enabling do_sample"
         )
+
+    # check LoRA rank in vLLM
+    if config.actor_rollout_ref.model.get("lora_rank", 0) > 0 and config.actor_rollout_ref.rollout.name == "vllm":
+        assert config.actor_rollout_ref.model.lora_rank <= 512, "LoRA rank in vLLM must be less than or equal to 512"
 
     print("[validate_config] All configuration checks passed successfully!")

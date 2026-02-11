@@ -76,9 +76,9 @@ def _ulysses_flash_attention_forward(
     ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
 
     ########## AlltoAll for Ulysses ##########
-    if ulysses_sp_size > 1:
-        assert position_ids is not None, "position_ids is required for Ulysses sequence parallelism"
-
+    # TODO: Disable sp for ViT, there's no elegent way to determine whether it's ViT or not.
+    # Use `position_ids` as condition since ViT doesn't pass it to flash attention.
+    if ulysses_sp_size > 1 and position_ids is not None:
         # NOTE: repeat kv heads to be divided by sequence parallel. Instead of repeating nheads_q//nheads_k,
         # we choose to repeat sp_size//nheads_k, since flash_attention supports MQA/GQA.
         # For example:
@@ -110,7 +110,7 @@ def _ulysses_flash_attention_forward(
     )
 
     ########## AlltoAll for Ulysses ##########
-    if ulysses_sp_size > 1:
+    if ulysses_sp_size > 1 and position_ids is not None:
         # (bsz, seq_len, n_head/n, head_dim) -> (bsz, seq_len/n, n_head, head_dim)
         attn_output = gather_heads_scatter_seq(attn_output, seq_dim=1, head_dim=2)
 
@@ -251,13 +251,31 @@ def apply_monkey_patch(
     use_remove_padding: bool = True,
     use_fused_kernels: bool = False,
     fused_kernels_backend: str = None,
+    use_tiled_mlp: bool = False,
+    tiled_mlp_shards: int = 4,
 ):
     """
-    Apply monkey patch to the models for ulysses sequence parallel and fused kernel.
+    Apply monkey patch to the models for ulysses sequence parallel, fused kernel, and tiled MLP.
 
     In the end of this function forward function of the model is patched for fused kernel.
     If the model is not supported with fused kernel, please return after patch.
+
+    Args:
+        model: The model to apply the monkey patch.
+        ulysses_sp_size: The size of ulysses sequence parallel.
+        use_remove_padding: Whether to use remove padding.
+        use_fused_kernels: Whether to use fused kernels.
+        fused_kernels_backend: The backend to use for fused kernels.
+        use_tiled_mlp: Whether to use TiledMLP for memory-efficient MLP computation.
+        tiled_mlp_shards: Number of shards for TiledMLP (higher = lower memory, slightly slower).
     """
+
+    # Apply TiledMLP monkey patch for memory-efficient MLP computation
+    if use_tiled_mlp:
+        from verl.models.transformers.tiled_mlp import apply_tiled_mlp_monkey_patch
+
+        model_type = getattr(model.config, "model_type", None)
+        apply_tiled_mlp_monkey_patch(num_shards=tiled_mlp_shards, model_type=model_type)
 
     """Replace _flash_attention_forward to _ulysses_flash_attention_forward"""
     module = sys.modules[model.__module__]
@@ -356,13 +374,21 @@ def apply_monkey_patch(
             Qwen3VLMoeTextModel,
         )
 
-        from verl.models.transformers.qwen3_vl import forward_with_normal_backend, qwen3_vl_base_forward
+        from verl.models.transformers.qwen3_vl import (
+            forward_with_normal_backend,
+            patch_qwen3_vl_moe_sparse_moe_block_forward,
+            qwen3_vl_base_forward,
+        )
 
         Qwen3VLModel.forward = qwen3_vl_base_forward
         Qwen3VLMoeModel.forward = qwen3_vl_base_forward
         Qwen3VLForConditionalGeneration.forward = forward_with_normal_backend
         Qwen3VLMoeForConditionalGeneration.forward = forward_with_normal_backend
         print(f"Monkey patch {model.__class__.__name__} model forward")
+
+        # Step 1.5: patch Qwen3VLMoeTextSparseMoeBlock to fix transformers 4.57.3 bug
+        if model.config.model_type == "qwen3_vl_moe" and is_transformers_version_in_range(max_version="4.57.3"):
+            patch_qwen3_vl_moe_sparse_moe_block_forward()
 
         # Step 2: patch input for multimodal sequence parallelism
         if ulysses_sp_size > 1:

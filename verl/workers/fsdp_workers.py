@@ -15,7 +15,6 @@
 The main entry point to run the PPO algorithm
 """
 
-import asyncio
 import datetime
 import json
 import logging
@@ -85,7 +84,9 @@ from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
+from verl.utils.ray_utils import get_event_loop
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
+from verl.workers.config.optimizer import build_optimizer
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
@@ -105,13 +106,20 @@ def create_device_mesh(world_size, fsdp_size):
     return device_mesh
 
 
-def get_sharding_strategy(device_mesh):
+def get_sharding_strategy(device_mesh, zero3_enable=True):
     from torch.distributed.fsdp import ShardingStrategy
 
+    if zero3_enable:
+        fsdp_strategy = ShardingStrategy.FULL_SHARD
+        hsdp_strategy = ShardingStrategy.HYBRID_SHARD
+    else:
+        fsdp_strategy = ShardingStrategy.SHARD_GRAD_OP
+        hsdp_strategy = ShardingStrategy._HYBRID_SHARD_ZERO2
+
     if device_mesh.ndim == 1:
-        sharding_strategy = ShardingStrategy.FULL_SHARD
+        sharding_strategy = fsdp_strategy
     elif device_mesh.ndim == 2:
-        sharding_strategy = ShardingStrategy.HYBRID_SHARD
+        sharding_strategy = hsdp_strategy
     else:
         raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
     return sharding_strategy
@@ -178,7 +186,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self._lora_rank = self.config.model.get("lora_rank", 0)
-        self._is_lora = self._lora_rank > 0
+        self._is_lora = self.config.model.get("lora_adapter_path") is not None or self._lora_rank > 0
 
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
@@ -278,8 +286,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         use_liger=False,
         role="actor",
         enable_activation_offload=False,
+        use_tiled_mlp=False,
+        tiled_mlp_shards=4,
     ):
-        from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
         from transformers import (
             AutoConfig,
@@ -293,6 +302,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         from verl.utils.torch_dtypes import PrecisionType
 
         assert role in ["actor", "ref"]
+
+        # TiledMLP requires FSDP2 for correct gradient computation
+        if use_tiled_mlp and self.config.actor.strategy == "fsdp":
+            raise ValueError("TiledMLP requires FSDP2. Set `actor_rollout_ref.actor.strategy=fsdp2`.")
 
         log_gpu_memory_usage(f"Before init {role} from HF AutoModel", logger=logger)
         local_path = model_path
@@ -315,14 +328,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
+        attn_implementation = override_model_config.get("attn_implementation", "flash_attention_2")
         actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
+            local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
         # Maybe support Ulysses in VisionAttention in the future and remove this patch
         if self.ulysses_sequence_parallel_size > 1 and hasattr(actor_model_config, "vision_config"):
             actor_model_config.vision_config._attn_implementation = "eager"
+
+        # patch for qwen2.5-vl: when using flash_attention_3, set vision tower to use flash_attention_2
+        # because the vision tower does not support flash_attention_3
+        if (
+            getattr(actor_model_config, "model_type", None) == "qwen2_5_vl"
+            and attn_implementation == "flash_attention_3"
+            and hasattr(actor_model_config, "vision_config")
+        ):
+            actor_model_config.vision_config._attn_implementation = "flash_attention_2"
 
         # patch for kimi-vl
         if getattr(actor_model_config, "model_type", None) == "kimi_vl":
@@ -378,6 +401,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 torch_dtype=torch_dtype,
                 config=actor_model_config,
                 trust_remote_code=trust_remote_code,
+                attn_implementation=attn_implementation,
             )
 
             # Apply Liger kernel to the model if use_liger is set to True
@@ -397,6 +421,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
                 use_fused_kernels=use_fused_kernels,
                 fused_kernels_backend=fused_kernels_backend,
+                use_tiled_mlp=use_tiled_mlp,
+                tiled_mlp_shards=tiled_mlp_shards,
             )
 
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
@@ -404,9 +430,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            if self._is_lora:
-                print("Applying LoRA to actor module")
-                actor_module.enable_input_require_grads()
+
+        if self._is_lora:
+            print("Applying LoRA to actor module")
+            actor_module.enable_input_require_grads()
+
+            lora_adapter_path = self.config.model.get("lora_adapter_path")
+            if lora_adapter_path is not None:
+                from peft import PeftModel
+
+                print(f"Loading pre-trained LoRA adapter to {role} from: {lora_adapter_path}")
+
+                # Copy adapter to local if needed
+                local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.config.model.get("use_shm", False))
+
+                actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True)
+                peft_config = actor_module.peft_config["default"]
+                # Ensure task_type is TaskType enum, not string
+                if isinstance(peft_config.task_type, str):
+                    peft_config.task_type = TaskType.CAUSAL_LM
+
+            else:
                 # Convert config to regular Python types before creating PEFT model
                 lora_config = {
                     "task_type": TaskType.CAUSAL_LM,
@@ -444,7 +488,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
             buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
         else:
-            param_dtype = torch.bfloat16
+            param_dtype = PrecisionType.to_dtype(fsdp_config.dtype)
             reduce_dtype = torch.float32
             buffer_dtype = torch.float32
 
@@ -453,18 +497,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         auto_wrap_policy = get_fsdp_wrap_policy(
             module=actor_module,
             config=fsdp_config.get("wrap_policy", None),
-            is_lora=self.config.model.get("lora_rank", 0) > 0,
+            is_lora=self._is_lora,
         )
 
-        if self._is_rollout and self.config.rollout.name == "hf":
-            # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
-            auto_wrap_policy = None
+        # if self._is_rollout and self.config.rollout.name == "hf":
+        #     # TODO(zhangchi.usc1992, shengguangming) fix me.
+        #     Current, auto_wrap_policy causes HFRollout to hang in Gemma
+        #     auto_wrap_policy = None
 
         if self.rank == 0:
             print(f"wrap_policy: {auto_wrap_policy}")
 
         fsdp_mesh = self.device_mesh
-        sharding_strategy = get_sharding_strategy(fsdp_mesh)
+        fsdp_enable_zero3 = fsdp_config.reshard_after_forward
+        sharding_strategy = get_sharding_strategy(fsdp_mesh, fsdp_enable_zero3)
 
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
@@ -520,12 +566,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-            actor_optimizer = optim.AdamW(
-                actor_module_fsdp.parameters(),
-                lr=optim_config.lr,
-                betas=optim_config.get("betas", (0.9, 0.999)),
-                weight_decay=optim_config.get("weight_decay", 1e-2),
-            )
+            actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
 
             total_steps = optim_config.get("total_training_steps", 0)
             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
@@ -582,6 +623,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         rollout_name = self.config.rollout.name
 
+        self.rollout_device_mesh = rollout_device_mesh
+
         if rollout_name == "hf":
             self._register_dispatch_collect_info("rollout", dp_rank=self.rank, is_collect=True)
         else:
@@ -627,11 +670,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 5. switch to trainer mode
         # NOTE: It's critical that hybrid engine in trainer mode initially to load checkpoint.
-        # For sync mode, we directly switch to trainer mode here.
         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
-        if rollout_config.mode == "sync" and self._is_actor:
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(self.trainer_mode())
+        # Note: sync mode is deprecated and rejected in RolloutConfig.__post_init__
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
@@ -756,6 +796,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 fsdp_config = FSDPEngineConfig()
 
             local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+            # TiledMLP configuration for memory-efficient MLP computation
+            tiled_mlp_config = self.config.model.get("tiled_mlp", {})
+            use_tiled_mlp = tiled_mlp_config.get("enabled", False)
+            tiled_mlp_shards = tiled_mlp_config.get("num_shards", 4)
+
             (
                 self.actor_module_fsdp,
                 self.actor_optimizer,
@@ -773,6 +818,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 use_liger=self.config.model.get("use_liger", False),
                 role="actor",
                 enable_activation_offload=self.config.model.get("enable_activation_offload", False),
+                use_tiled_mlp=use_tiled_mlp,
+                tiled_mlp_shards=tiled_mlp_shards,
             )
 
             # get the original unwrapped module
@@ -805,6 +852,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self.rank == 0:
                 print("reference model:", ref_model_path)
             local_path = copy_to_local(ref_model_path, use_shm=use_shm)
+
+            # TiledMLP for ref model: use ref config if specified, otherwise use actor config
+            ref_tiled_mlp_config = self.config.ref.get("tiled_mlp", None)
+            if ref_tiled_mlp_config is None:
+                ref_tiled_mlp_config = self.config.model.get("tiled_mlp", {})
+            ref_use_tiled_mlp = ref_tiled_mlp_config.get("enabled", False)
+            ref_tiled_mlp_shards = ref_tiled_mlp_config.get("num_shards", 4)
+
             self.ref_module_fsdp = self._build_model_optimizer(
                 model_path=local_path,
                 fsdp_config=omega_conf_to_dataclass(self.config.ref.fsdp_config),
@@ -815,6 +870,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 trust_remote_code=self.config.model.get("trust_remote_code", False),
                 use_liger=self.config.model.get("use_liger", False),
                 role="ref",
+                use_tiled_mlp=ref_use_tiled_mlp,
+                tiled_mlp_shards=ref_tiled_mlp_shards,
             )[0]
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):
@@ -871,7 +928,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics["actor/lr"] = lr
+            metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
             self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
@@ -907,11 +964,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            loop = get_event_loop()
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
@@ -957,16 +1010,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         is_lora = data.meta_info.pop("is_lora", False)
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         # we should always recompute old_log_probs when it is HybridEngine
-        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
-        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        config_source = self.config.ref if is_lora else self.config.rollout
+        data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=not is_lora)
+            tensors = {"ref_log_prob": output} if is_lora else {"old_log_probs": output}
+            if not is_lora:
+                tensors["entropys"] = entropys
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 
@@ -989,10 +1046,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_lora:
             # if _is_lora, actor without lora applied is the ref
             data.meta_info["is_lora"] = True
-            data = self.compute_log_prob(data)
-            # this old_log_probs is in fact ref_log_prob
-            data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
-            return data
+            return self.compute_log_prob(data)
         assert self._is_ref
         # else:
         # otherwise, the class have a standalone ref model
@@ -1074,6 +1128,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             f"Checkpoint loading is only supported for Actor or standalone Rollout Workers, but got "
             f"{self._is_actor} and {self._is_rollout}"
         )
+
+        # No checkpoint to load, just offload the model and optimizer to CPU
+        if local_path is None:
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(self.actor_optimizer)
+            return
 
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -1191,12 +1253,13 @@ class CriticWorker(Worker, DistProfilerExtension):
                 f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than "
                 f"ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
             )
-        self._is_lora = self.config.model.get("lora_rank", 0) > 0
+        self._is_lora = (
+            self.config.model.get("lora_adapter_path") is not None or self.config.model.get("lora_rank", 0) > 0
+        )
         self.use_orig_params = self.config.model.fsdp_config.get("use_orig_params", False)
 
     def _build_critic_model_optimizer(self, config):
         # the following line is necessary
-        from torch import optim
         from torch.distributed.fsdp import MixedPrecision
 
         from verl.utils.model import load_valuehead_model, print_model_size
@@ -1231,9 +1294,11 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         from transformers import AutoConfig
 
+        # override model kwargs
+        attn_implementation = override_config.get("attn_implementation", "flash_attention_2")
         critic_model_config = AutoConfig.from_pretrained(
             local_path,
-            attn_implementation="flash_attention_2",
+            attn_implementation=attn_implementation,
             trust_remote_code=config.model.get("trust_remote_code", False),
         )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
@@ -1250,6 +1315,15 @@ class CriticWorker(Worker, DistProfilerExtension):
         init_context = get_init_weight_context_manager(
             use_meta_tensor=not critic_model_config.tie_word_embeddings, mesh=self.device_mesh
         )
+
+        # TiledMLP configuration for memory-efficient MLP computation
+        tiled_mlp_config = config.model.get("tiled_mlp", {})
+        use_tiled_mlp = tiled_mlp_config.get("enabled", False)
+        tiled_mlp_shards = tiled_mlp_config.get("num_shards", 4)
+
+        # TiledMLP requires FSDP2 for correct gradient computation
+        if use_tiled_mlp and config.strategy == "fsdp":
+            raise ValueError("TiledMLP requires FSDP2. Set `critic.strategy=fsdp2`.")
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -1270,6 +1344,8 @@ class CriticWorker(Worker, DistProfilerExtension):
                 model=critic_module,
                 use_remove_padding=use_remove_padding,
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
+                use_tiled_mlp=use_tiled_mlp,
+                tiled_mlp_shards=tiled_mlp_shards,
             )
 
             # some parameters may not in torch_dtype
@@ -1281,15 +1357,35 @@ class CriticWorker(Worker, DistProfilerExtension):
         if self._is_lora:
             print("Applying LoRA to critic module")
             critic_module.enable_input_require_grads()
-            # Convert config to regular Python types before creating PEFT model
-            lora_config = {
-                "task_type": TaskType.CAUSAL_LM,
-                "r": self.config.model.lora_rank,
-                "lora_alpha": self.config.model.lora_alpha,
-                "target_modules": convert_to_regular_types(self.config.model.target_modules),
-                "bias": "none",
-            }
-            critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
+
+            # Check if we should load a pre-trained LoRA adapter
+            lora_adapter_path = self.config.model.get("lora_adapter_path")
+            if lora_adapter_path is not None:
+                from peft import PeftModel
+
+                print(f"Loading pre-trained LoRA adapter to critic from: {lora_adapter_path}")
+
+                # Copy adapter to local if needed
+                local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.config.model.get("use_shm", False))
+
+                critic_module = PeftModel.from_pretrained(critic_module, local_adapter_path, is_trainable=True)
+                peft_config = critic_module.peft_config["default"]
+                # Ensure task_type is TaskType enum, not string
+                # Use TOKEN_CLS for Critic since it's loaded as AutoModelForTokenClassification
+                if isinstance(peft_config.task_type, str):
+                    peft_config.task_type = TaskType.TOKEN_CLS
+
+            else:
+                # Convert config to regular Python types before creating PEFT model
+                # Use TOKEN_CLS for Critic since it's loaded as AutoModelForTokenClassification
+                lora_config = {
+                    "task_type": TaskType.TOKEN_CLS,
+                    "r": self.config.model.lora_rank,
+                    "lora_alpha": self.config.model.lora_alpha,
+                    "target_modules": convert_to_regular_types(self.config.model.target_modules),
+                    "bias": "none",
+                }
+                critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
 
         if self.rank == 0:
             print_model_size(critic_module)
@@ -1312,7 +1408,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         auto_wrap_policy = get_fsdp_wrap_policy(
             module=critic_module,
             config=self.config.model.fsdp_config.wrap_policy,
-            is_lora=self.config.model.get("lora_rank", 0) > 0,
+            is_lora=self._is_lora,
         )
 
         log_gpu_memory_usage("Before critic FSDP", logger=None)
@@ -1377,12 +1473,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage("After critic FSDP", logger=None)
 
-        critic_optimizer = optim.AdamW(
-            critic_module.parameters(),
-            lr=config.optim.lr,
-            betas=config.optim.get("betas", (0.9, 0.999)),
-            weight_decay=config.optim.get("weight_decay", 1e-2),
-        )
+        critic_optimizer = build_optimizer(critic_module.parameters(), config.optim)
 
         total_steps = config.optim.get("total_training_steps", 0)
         num_warmup_steps = int(config.optim.get("lr_warmup_steps", -1))
@@ -1448,7 +1539,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         )
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
-    @DistProfiler.annotate(color="cyan")
+    @DistProfiler.annotate(color="cyan", role="compute_values")
     def compute_values(self, data: DataProto):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
@@ -1468,7 +1559,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
-    @DistProfiler.annotate(color="pink")
+    @DistProfiler.annotate(color="pink", role="critic_update")
     def update_critic(self, data: DataProto):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
@@ -1619,7 +1710,12 @@ class RewardModelWorker(Worker, DistProfilerExtension):
             self.tokenizer = hf_tokenizer(local_path, trust_remote_code=config.model.get("trust_remote_code", False))
 
         trust_remote_code = config.model.get("trust_remote_code", False)
-        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+        override_config = OmegaConf.to_container(OmegaConf.create(config.model.get("override_config", {})))
+        model_config = AutoConfig.from_pretrained(
+            local_path,
+            trust_remote_code=trust_remote_code,
+            attn_implementation=override_config.get("attn_implementation", "flash_attention_2"),
+        )
         model_config.num_labels = 1
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
@@ -1634,7 +1730,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
                 trust_remote_code=trust_remote_code,
             )
 
@@ -1832,7 +1927,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         return DataProto.from_dict(rm_inputs)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="reward"))
-    @DistProfiler.annotate(color="brown")
+    @DistProfiler.annotate(color="brown", role="compute_rm_score")
     def compute_rm_score(self, data: DataProto):
         import itertools
 
