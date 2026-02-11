@@ -15,6 +15,7 @@ actor_rollout_ref.actor.ppo_mini_batch_size=72 \
 actor_rollout_ref.actor.ppo_micro_batch_size=12 \
 actor_rollout_ref.rollout.log_prob_micro_batch_size=12 \
 actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
+actor_rollout_ref.rollout.name=vllm \
 actor_rollout_ref.rollout.dtype=bfloat16 \
 actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
 actor_rollout_ref.ref.log_prob_micro_batch_size=6 \
