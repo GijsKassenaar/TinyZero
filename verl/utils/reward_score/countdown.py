@@ -11,8 +11,7 @@ def extract_solution(solution_str):
         solution_str = solution_str.split("Assistant:", 1)[1]
     elif "<|im_start|>assistant" in solution_str:
         solution_str = solution_str.split("<|im_start|>assistant", 1)[1]
-    else:
-        return None
+    # If neither marker is present, keep the original string.
     solution_str = solution_str.split('\n')[-1]
 
     answer_pattern = r'<answer>(.*?)</answer>'
