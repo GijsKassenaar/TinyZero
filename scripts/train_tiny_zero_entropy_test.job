@@ -29,7 +29,7 @@ mkdir -p $HF_HOME
 
 cd $HOME/TinyZero
 
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 export N_GPUS=4
 export ROLLOUT_TP_SIZE=1
 export DATA_DIR=$PWD
