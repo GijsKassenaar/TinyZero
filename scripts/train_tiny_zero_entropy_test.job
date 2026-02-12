@@ -13,6 +13,10 @@
 #SBATCH --mem=600G
 #SBATCH --time=02:00:00
 
+module purge
+module load 2025
+module load CUDA/12.8.0
+
 source ~/.bashrc
 conda activate zero
 
