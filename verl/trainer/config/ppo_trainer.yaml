@@ -194,6 +194,13 @@ agent:
     # Phased schedule for fixed windows
     phased_schedule: null
 
+  # Entropy logging configuration
+  entropy_logging:
+    # Enable per-token entropy saving to disk
+    enable: false
+    # Directory to save entropy data (relative to default_local_dir or absolute)
+    output_dir: entropy_data
+
 # config for the trainer
 trainer:
 

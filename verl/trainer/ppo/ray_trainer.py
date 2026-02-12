@@ -45,10 +45,13 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.adaptive_window import AdaptiveSuccessWindowConfig, AdaptiveSuccessWindowController
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    compute_completion_metrics,
     compute_data_metrics,
+    compute_difficulty_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+    save_entropy_data,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -1484,6 +1487,10 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
+                            # Keep entropy in batch as 'old_entropy' for file-based saving
+                            entropy_cfg = OmegaConf.select(self.config, "agent.entropy_logging")
+                            if entropy_cfg is not None and entropy_cfg.get("enable", False):
+                                old_log_prob.batch["old_entropy"] = old_log_prob.batch["entropys"]
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
                             if "rollout_log_probs" in batch.batch.keys():
@@ -1645,6 +1652,30 @@ class RayPPOTrainer:
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
                 # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+
+                # Difficulty-specific accuracy (e.g., levels 3 and 4).
+                difficulty_metrics = compute_difficulty_metrics(batch=batch)
+                metrics.update(difficulty_metrics)
+
+                # Completion statistics: truncated vs finished and correctness.
+                # For adaptive runs we use the current adaptive window as budget,
+                # otherwise fall back to the configured max response length.
+                if hasattr(self, "_adaptive_window") and self._adaptive_window is not None:
+                    generation_budget = int(self._adaptive_window.get_window_size())
+                else:
+                    generation_budget = int(batch.batch["responses"].shape[-1])
+                completion_metrics = compute_completion_metrics(batch=batch, generation_budget=generation_budget)
+                metrics.update(completion_metrics)
+
+                # Save per-token entropy data to disk for analysis
+                # Data is saved to: {default_local_dir}/entropy_data/entropy_step_{step}.pt
+                entropy_cfg = OmegaConf.select(self.config, "agent.entropy_logging")
+                if entropy_cfg is not None and entropy_cfg.get("enable", False) and "old_entropy" in batch.batch.keys():
+                    entropy_output_dir = os.path.join(
+                        self.config.trainer.default_local_dir,
+                        entropy_cfg.get("output_dir", "entropy_data"),
+                    )
+                    save_entropy_data(batch=batch, step=self.global_steps, output_dir=entropy_output_dir)
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):

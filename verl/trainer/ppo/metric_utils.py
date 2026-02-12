@@ -22,6 +22,8 @@ from typing import Any, Callable
 import numpy as np
 import torch
 
+import os
+
 from verl import DataProto
 from verl.utils.import_utils import deprecated
 
@@ -300,6 +302,239 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
         "perf/time_per_step": time,
         "perf/throughput": total_num_tokens / (time * n_gpus),
     }
+
+
+def save_entropy_data(batch: DataProto, step: int, output_dir: str):
+    """Save per-token entropy for each rollout to disk.
+
+    Saves a .pt file containing:
+    - old_entropy: (batch_size, response_length) - Shannon entropy per token
+    - attention_mask: (batch_size, prompt_length + response_length) - to identify valid tokens
+    - rewards: (batch_size,) - binary reward (0 or 1) per sample
+    - uids: (batch_size,) - UUIDs identifying which responses belong to the same prompt (GRPO groups)
+
+    Args:
+        batch: DataProto with rollout data
+        step: Current training step
+        output_dir: Directory to save entropy data
+    """
+    import os
+
+    if "old_entropy" not in batch.batch.keys():
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Extract binary reward (0 or 1) per sample
+    # The reward is placed at the EOS position, so summing gives the binary value
+    binary_rewards = None
+    if "token_level_scores" in batch.batch.keys():
+        token_level_scores = batch.batch["token_level_scores"]
+        binary_rewards = token_level_scores.sum(dim=-1).cpu()  # (batch,) - binary 0 or 1
+
+    # Extract UIDs for group reconstruction (GRPO groups)
+    uids = None
+    if "uid" in batch.non_tensor_batch:
+        uids = batch.non_tensor_batch["uid"]  # (batch,) - numpy array of UUIDs
+
+    # Extract tensors to save
+    save_dict = {
+        "step": step,
+        "old_entropy": batch.batch["old_entropy"].cpu(),  # (batch, response_len)
+        "attention_mask": batch.batch["attention_mask"].cpu(),  # (batch, prompt_len + response_len)
+    }
+
+    # Add binary rewards if available
+    if binary_rewards is not None:
+        save_dict["rewards"] = binary_rewards  # (batch,) - binary reward (0 or 1)
+
+    # Add UIDs if available (for reconstructing GRPO groups)
+    if uids is not None:
+        save_dict["uids"] = uids  # (batch,) - UUIDs to identify which responses share the same prompt
+
+    # Save to file
+    filepath = os.path.join(output_dir, f"entropy_step_{step:06d}.pt")
+    torch.save(save_dict, filepath)
+    print(f"[Entropy] Saved entropy data for step {step} to {filepath}")
+
+
+def compute_completion_metrics(batch: DataProto, generation_budget: int) -> dict[str, Any]:
+    """Compute fractions of truncated / finished responses and their correctness.
+
+    Args:
+        batch: DataProto after rollout + reward computation.
+        generation_budget: The effective max number of response tokens allowed
+            during generation (e.g., max_response_length or adaptive window).
+    """
+    response_info = _compute_response_info(batch)
+    response_length = response_info["response_length"]  # (batch_size,)
+
+    # Identify responses that hit (or exceed) the generation budget.
+    truncated_mask = response_length >= generation_budget
+    finished_mask = ~truncated_mask
+
+    batch_size = response_length.shape[0]
+    if batch_size == 0:
+        return {
+            "completion/truncated_frac": 0.0,
+            "completion/finished_frac": 0.0,
+            "completion/truncated_correct_frac": 0.0,
+            "completion/finished_correct_frac": 0.0,
+            "completion/correct_mean_length": 0.0,
+            "completion/success_rate": 0.0,
+        }
+
+    truncated_frac = truncated_mask.float().mean().item()
+    finished_frac = finished_mask.float().mean().item()
+
+    # Sequence-level raw task score (before KL), e.g. 0, 0.1, 1.0 for countdown.
+    if "token_level_scores" in batch.batch:
+        token_level_scores = batch.batch["token_level_scores"]
+        seq_scores = token_level_scores.sum(-1)
+        correct_mask = seq_scores >= 0.99  # treat ~1.0 as strictly correct
+    else:
+        # Fallback: no notion of correctness
+        correct_mask = torch.zeros_like(response_length, dtype=torch.bool)
+
+    truncated_count = truncated_mask.float().sum().item()
+    finished_count = finished_mask.float().sum().item()
+
+    correct_count = correct_mask.float().sum().item()
+    if correct_count > 0:
+        correct_mean_length = response_length[correct_mask].float().mean().item()
+    else:
+        correct_mean_length = 0.0
+
+    if truncated_count > 0:
+        truncated_correct_frac = (truncated_mask & correct_mask).float().sum().item() / truncated_count
+    else:
+        truncated_correct_frac = 0.0
+
+    if finished_count > 0:
+        finished_correct_frac = (finished_mask & correct_mask).float().sum().item() / finished_count
+    else:
+        finished_correct_frac = 0.0
+
+    # Overall success rate (fraction of correct answers)
+    overall_success_rate = correct_count / batch_size if batch_size > 0 else 0.0
+
+    metrics = {
+        "completion/truncated_frac": truncated_frac,
+        "completion/finished_frac": finished_frac,
+        "completion/truncated_correct_frac": truncated_correct_frac,
+        "completion/finished_correct_frac": finished_correct_frac,
+        "completion/correct_mean_length": correct_mean_length,
+        "completion/success_rate": overall_success_rate,
+    }
+
+    # Add UUID-based group metrics if available
+    if "uid" in batch.non_tensor_batch:
+        group_metrics = compute_group_success_metrics(batch, correct_mask)
+        metrics.update(group_metrics)
+
+    return metrics
+
+
+def compute_group_success_metrics(batch: DataProto, correct_mask: torch.Tensor) -> dict[str, Any]:
+    """Compute success metrics for GRPO groups (responses sharing the same prompt).
+
+    Args:
+        batch: DataProto with non_tensor_batch['uid'] containing UUIDs
+        correct_mask: Boolean tensor indicating which responses are correct
+
+    Returns:
+        Dictionary with group-level success metrics
+    """
+    uids = batch.non_tensor_batch["uid"]
+
+    # Group correctness by UID
+    uid_to_correct = defaultdict(list)
+
+    for i, uid in enumerate(uids):
+        is_correct = correct_mask[i].item() if torch.is_tensor(correct_mask[i]) else correct_mask[i]
+        uid_to_correct[uid].append(is_correct)
+
+    # Count groups by number of correct answers
+    group_counts = defaultdict(int)
+    total_groups = len(uid_to_correct)
+
+    for uid, correctness_list in uid_to_correct.items():
+        num_correct = sum(correctness_list)
+        group_counts[num_correct] += 1
+
+    if total_groups == 0:
+        return {}
+
+    # Build metrics as percentages
+    metrics = {}
+    # Adapt to actual max group size
+    max_group_size = max(len(c) for c in uid_to_correct.values()) if uid_to_correct else 4
+
+    for i in range(max_group_size + 1):
+        count = group_counts.get(i, 0)
+        percentage = 100.0 * count / total_groups
+        metrics[f"completion/group_{i}of{max_group_size}_correct_pct"] = percentage
+
+    return metrics
+
+
+def compute_difficulty_metrics(batch: DataProto) -> dict[str, Any]:
+    """Compute accuracy broken down by difficulty level (e.g. 3 vs 4).
+
+    We assume that non_tensor_batch['reward_model'][i]['ground_truth'] contains
+    a 'difficulty' field for each sample.
+    """
+    if "token_level_scores" not in batch.batch:
+        return {}
+
+    # Sequence-level raw scores to determine correctness.
+    token_level_scores = batch.batch["token_level_scores"]
+    seq_scores = token_level_scores.sum(-1)
+    correct_mask = seq_scores >= 0.99  # strictly correct
+
+    rm_info = batch.non_tensor_batch.get("reward_model", None)
+    if rm_info is None:
+        return {}
+
+    # Extract per-sample difficulty if available.
+    difficulties = []
+    for i in range(len(seq_scores)):
+        info = rm_info[i]
+        gt = info.get("ground_truth", {})
+        difficulties.append(gt.get("difficulty", None))
+
+    # Compute counts and accuracies for difficulty 3 and 4.
+    diff3_total = 0
+    diff3_correct = 0
+    diff4_total = 0
+    diff4_correct = 0
+
+    for i, d in enumerate(difficulties):
+        if d == 3:
+            diff3_total += 1
+            if correct_mask[i]:
+                diff3_correct += 1
+        elif d == 4:
+            diff4_total += 1
+            if correct_mask[i]:
+                diff4_correct += 1
+
+    metrics = {}
+    if diff3_total > 0:
+        metrics["difficulty/3_acc"] = diff3_correct / diff3_total
+        metrics["difficulty/3_count"] = float(diff3_total)
+    else:
+        metrics["difficulty/3_acc"] = 0.0
+        metrics["difficulty/3_count"] = 0.0
+
+    if diff4_total > 0:
+        metrics["difficulty/4_acc"] = diff4_correct / diff4_total
+        metrics["difficulty/4_count"] = float(diff4_total)
+    else:
+        metrics["difficulty/4_acc"] = 0.0
+        metrics["difficulty/4_count"] = 0.0
+
+    return metrics
 
 
 def bootstrap_metric(
