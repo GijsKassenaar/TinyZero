@@ -75,7 +75,7 @@ python3 -m verl.trainer.main_ppo \
     critic.model.fsdp_config.model_dtype=bfloat16 \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.total_training_steps=20 \
+    trainer.total_training_steps=6 \
     trainer.save_freq=100 \
     trainer.test_freq=25 \
     trainer.val_before_train=False \
