@@ -40,7 +40,8 @@ python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
     data.val_files=$DATA_DIR/test.parquet \
     data.train_batch_size=256 \
-    data.val_batch_size=1312 \
+    data.val_batch_size=256 \
+    data.dataloader_num_workers=2 \
     data.max_prompt_length=256 \
     data.max_response_length=2048 \
     actor_rollout_ref.model.path=$BASE_MODEL \
@@ -74,7 +75,7 @@ python3 -m verl.trainer.main_ppo \
     critic.model.fsdp_config.model_dtype=bfloat16 \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.total_training_steps=4 \
+    trainer.total_training_steps=7 \
     trainer.save_freq=100 \
     trainer.test_freq=25 \
     trainer.val_before_train=False \

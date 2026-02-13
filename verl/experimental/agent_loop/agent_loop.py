@@ -431,6 +431,10 @@ class AgentLoopWorkerBase:
             logprobs=config.calculate_log_probs,
         )
 
+        max_tokens = batch.meta_info.get("max_tokens") if batch.meta_info is not None else None
+        if max_tokens is not None:
+            sampling_params["max_tokens"] = int(max_tokens)
+
         # override sampling params for validation
         if batch.meta_info.get("validate", False):
             sampling_params["top_p"] = config.val_kwargs.top_p
