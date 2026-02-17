@@ -34,7 +34,7 @@ export N_GPUS=4
 export ROLLOUT_TP_SIZE=1
 export DATA_DIR=$PWD
 export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-export EXPERIMENT_NAME=truncation_recovery_test
+export EXPERIMENT_NAME=test_normalphased
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
@@ -68,15 +68,13 @@ python3 -m verl.trainer.main_ppo \
     agent.adaptive_window.enable=True \
     agent.adaptive_window.mode=phased \
     agent.adaptive_window.initial_window=1024 \
-    agent.adaptive_window.min_window=20 \
     agent.adaptive_window.max_window=2048 \
     agent.adaptive_window.phased_schedule='[[50,2048]]' \
-    critic.model.fsdp_config.model_dtype=bfloat16 \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.total_training_steps=7 \
     trainer.save_freq=100 \
-    trainer.test_freq=25 \
+    trainer.test_freq=0 \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name=TinyZero \
