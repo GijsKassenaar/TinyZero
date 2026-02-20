@@ -19,8 +19,8 @@ from collections import defaultdict
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-CORRECT_PERCENTILE = 0.8   # Upper bound percentile for correct answers (e.g., 0.8 = 80th percentile)
-INCORRECT_PERCENTILE = 0.8  # Lower bound percentile for incorrect answers (e.g., 0.2 = 20th percentile)
+CORRECT_PERCENTILE = 0.4   # Upper bound percentile for correct answers (e.g., 0.8 = 80th percentile)
+INCORRECT_PERCENTILE = 0.2  # Lower bound percentile for incorrect answers (e.g., 0.2 = 20th percentile)
 # ============================================================================
 
 def load_all_entropy_files(data_dir):
@@ -55,7 +55,7 @@ def compute_stats_per_response(tensor, mask):
     valid_count = mask.sum(dim=1)
     return valid_sum / valid_count.clamp(min=1)
 
-def moving_average(data, window_size=10):
+def moving_average(data, window_size=50):
     """Compute moving average for smoothing"""
     if len(data) < window_size:
         return data
@@ -513,8 +513,6 @@ def plot_comparison(all_results, output_dir='./', all_data=None):
         # Apply moving average for smoothing
         correct_ent_smooth = moving_average(correct_pos_ent[:max_pos], window_size=10)
         incorrect_ent_smooth = moving_average(incorrect_pos_ent[:max_pos], window_size=10)
-        correct_varent_smooth = moving_average(correct_pos_varent[:max_pos], window_size=10)
-        incorrect_varent_smooth = moving_average(incorrect_pos_varent[:max_pos], window_size=10)
         
         # Compute 80th percentile across all steps for correct answers and 20th for incorrect
         all_correct_entropy_raw = []
@@ -668,7 +666,7 @@ def print_summary_statistics(all_results):
     print(f"    Mean: {all_incorrect_entropy.mean():.4f} ± {all_incorrect_entropy.std():.4f}")
     print(f"    Median: {all_incorrect_entropy.median():.4f}")
     print(f"    Range: [{all_incorrect_entropy.min():.4f}, {all_incorrect_entropy.max():.4f}]")
-    print(f"  Difference (Incorrect - Correct): {all_incorrect_entropy.mean() - all_correct_entropy.mean():.4f}"
+    print(f"  Difference (Incorrect - Correct): {all_incorrect_entropy.mean() - all_correct_entropy.mean():.4f}")
     
     print("\n" + "="*70)
 
