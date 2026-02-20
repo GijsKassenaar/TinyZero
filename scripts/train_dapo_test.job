@@ -37,12 +37,12 @@ export EXPERIMENT_NAME=test_dapo
 python3 -m recipe.dapo.main_dapo \
     data.train_files=$DATA_DIR/train.parquet \
     data.val_files=$DATA_DIR/test.parquet \
-    data.train_batch_size=256 \
+    data.train_batch_size=128 \
     data.gen_batch_size=256 \
     data.val_batch_size=256 \
     data.dataloader_num_workers=2 \
     data.max_prompt_length=256 \
-    data.max_response_length=2048 \
+    data.max_response_length=1536 \
     actor_rollout_ref.model.path=$BASE_MODEL \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
@@ -56,7 +56,7 @@ python3 -m recipe.dapo.main_dapo \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
     actor_rollout_ref.rollout.name=vllm \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
     reward_model.reward_manager=dapo \
@@ -69,7 +69,7 @@ python3 -m recipe.dapo.main_dapo \
     algorithm.kl_ctrl.kl_coef=0.001 \
     algorithm.filter_groups.enable=True \
     algorithm.filter_groups.metric=acc \
-    algorithm.filter_groups.max_num_gen_batches=10 \
+    algorithm.filter_groups.max_num_gen_batches=5 \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.resume_mode=disable \
