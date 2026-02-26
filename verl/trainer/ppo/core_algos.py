@@ -96,6 +96,7 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
+    GRPO_LAMBDA = "grpo_lambda"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
@@ -326,6 +327,241 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+def compute_grpo_lambda_advantages(
+    rewards: torch.Tensor,
+    sequence_mask: torch.Tensor,
+    gamma: float = 1.0,
+    lam: float = 0.9,
+    epsilon: float = 1e-6,
+) -> torch.Tensor:
+    """Compute token-level GRPO-λ advantages with backward eligibility traces.
+
+    This function expects grouped trajectories and performs group-wise reward normalization,
+    then applies a backward decay trace:
+        A_t = (gamma * lam)^(T - 1 - t) * normalized_reward
+
+    where T is the valid sequence length for each sample inferred from ``sequence_mask``.
+
+    Args:
+        rewards: Tensor of shape (batch, group, seq_len). Typically token-level rewards.
+        sequence_mask: Tensor of shape (batch, group, seq_len), where valid tokens are 1.
+        gamma: Discount factor.
+        lam: Eligibility trace decay factor.
+        epsilon: Numerical stability constant for normalization.
+
+    Returns:
+        Tensor of shape (batch, group, seq_len) containing masked token-level advantages.
+    """
+    if rewards.ndim != 3:
+        raise ValueError(f"Expected rewards to be 3D (batch, group, seq_len), got shape={tuple(rewards.shape)}")
+    if rewards.shape != sequence_mask.shape:
+        raise ValueError(
+            "rewards and sequence_mask must have the same shape, "
+            + f"got {tuple(rewards.shape)} vs {tuple(sequence_mask.shape)}"
+        )
+
+    mask = sequence_mask.to(dtype=rewards.dtype)
+
+    # Sequence-level outcomes per sample (batch, group).
+    sequence_rewards = torch.sum(rewards * mask, dim=-1)
+    group_valid = (mask.sum(dim=-1) > 0).to(dtype=rewards.dtype)
+
+    valid_group_count = group_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+    group_mean = (sequence_rewards * group_valid).sum(dim=1, keepdim=True) / valid_group_count
+
+    centered = (sequence_rewards - group_mean) * group_valid
+    group_var = (centered * centered).sum(dim=1, keepdim=True) / valid_group_count
+    group_std = torch.sqrt(group_var + epsilon)
+    normalized_reward = centered / (group_std + epsilon)
+
+    # Backward trace exponent computed from actual valid token positions per sequence.
+    valid_token_lengths = mask.sum(dim=-1, keepdim=True)
+    token_positions = (torch.cumsum(mask, dim=-1) - 1.0).clamp(min=0.0)
+    exponents = (valid_token_lengths - 1.0 - token_positions).clamp(min=0.0)
+
+    decay_base = rewards.new_tensor(gamma * lam)
+    decay_trace = torch.pow(decay_base, exponents)
+
+    token_advantages = normalized_reward.unsqueeze(-1) * decay_trace * mask
+    return token_advantages
+
+
+@register_adv_est(AdvantageEstimator.GRPO_LAMBDA)
+def compute_grpo_lambda_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    gamma: float = 1.0,
+    lam: float = 0.9,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute GRPO-λ token-level advantages for flattened grouped trajectories.
+
+    Grouping is inferred from ``index`` (usually prompt uid). For each group, the function:
+    1) computes sequence-level rewards,
+    2) performs group-wise normalization,
+    3) applies backward eligibility traces on valid tokens only.
+
+    Notes:
+        - ``norm_adv_by_std_in_grpo=False`` is supported by skipping std scaling while
+          keeping mean-centering.
+        - Returns both advantages and returns as the same tensor for outcome-only RLVR.
+    """
+    if token_level_rewards.shape != response_mask.shape:
+        raise ValueError(
+            "token_level_rewards and response_mask must have the same shape, "
+            + f"got {tuple(token_level_rewards.shape)} vs {tuple(response_mask.shape)}"
+        )
+
+    with torch.no_grad():
+        bsz, seq_len = token_level_rewards.shape
+        grouped_indices: dict[Any, list[int]] = defaultdict(list)
+        for i in range(bsz):
+            grouped_indices[index[i]].append(i)
+
+        num_groups = len(grouped_indices)
+        max_group_size = max(len(idxs) for idxs in grouped_indices.values())
+
+        grouped_rewards = token_level_rewards.new_zeros((num_groups, max_group_size, seq_len))
+        grouped_mask = response_mask.to(dtype=token_level_rewards.dtype).new_zeros((num_groups, max_group_size, seq_len))
+
+        group_keys = list(grouped_indices.keys())
+        for group_pos, group_key in enumerate(group_keys):
+            sample_indices = grouped_indices[group_key]
+            n = len(sample_indices)
+            sample_index_tensor = torch.tensor(sample_indices, dtype=torch.long, device=token_level_rewards.device)
+            grouped_rewards[group_pos, :n] = token_level_rewards.index_select(0, sample_index_tensor)
+            grouped_mask[group_pos, :n] = response_mask.index_select(0, sample_index_tensor).to(
+                dtype=token_level_rewards.dtype
+            )
+
+        token_advantages_grouped = compute_grpo_lambda_advantages(
+            rewards=grouped_rewards,
+            sequence_mask=grouped_mask,
+            gamma=gamma,
+            lam=lam,
+            epsilon=epsilon,
+        )
+
+        if not norm_adv_by_std_in_grpo:
+            # Convert from z-score to centered-only reward by multiplying back group std.
+            # We recompute centered rewards and apply the same trace shape.
+            sequence_rewards = torch.sum(grouped_rewards * grouped_mask, dim=-1)
+            group_valid = (grouped_mask.sum(dim=-1) > 0).to(dtype=token_level_rewards.dtype)
+            valid_group_count = group_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+            group_mean = (sequence_rewards * group_valid).sum(dim=1, keepdim=True) / valid_group_count
+            centered_reward = (sequence_rewards - group_mean) * group_valid
+
+            valid_token_lengths = grouped_mask.sum(dim=-1, keepdim=True)
+            token_positions = (torch.cumsum(grouped_mask, dim=-1) - 1.0).clamp(min=0.0)
+            exponents = (valid_token_lengths - 1.0 - token_positions).clamp(min=0.0)
+            decay_trace = torch.pow(token_level_rewards.new_tensor(gamma * lam), exponents)
+
+            token_advantages_grouped = centered_reward.unsqueeze(-1) * decay_trace * grouped_mask
+
+        token_advantages = torch.zeros_like(token_level_rewards)
+        for group_pos, group_key in enumerate(group_keys):
+            sample_indices = grouped_indices[group_key]
+            n = len(sample_indices)
+            sample_index_tensor = torch.tensor(sample_indices, dtype=torch.long, device=token_level_rewards.device)
+            token_advantages.index_copy_(0, sample_index_tensor, token_advantages_grouped[group_pos, :n])
+
+    return token_advantages, token_advantages
+
+
+def compute_grpo_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    token_advantages: torch.Tensor,
+    sequence_mask: torch.Tensor,
+    eps: float = 0.2,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute GRPO clipped surrogate loss with internal ε-trace weighting.
+
+    The provided ``token_advantages`` are treated as already trace-weighted (internal style),
+    and are multiplied with policy ratios *inside* the clipping objective.
+    Padding tokens are fully masked out.
+    """
+    if not (
+        log_probs.shape == old_log_probs.shape == token_advantages.shape == sequence_mask.shape
+    ):
+        raise ValueError(
+            "All inputs must share the same shape. "
+            + f"got log_probs={tuple(log_probs.shape)}, old_log_probs={tuple(old_log_probs.shape)}, "
+            + f"token_advantages={tuple(token_advantages.shape)}, sequence_mask={tuple(sequence_mask.shape)}"
+        )
+
+    mask = sequence_mask.to(dtype=log_probs.dtype)
+    log_ratio = torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0)
+    ratio = torch.exp(log_ratio)
+
+    surr1 = ratio * token_advantages
+    surr2 = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * token_advantages
+    objective = torch.minimum(surr1, surr2)
+
+    denom = mask.sum().clamp(min=1.0)
+    pg_loss = -(objective * mask).sum() / denom
+
+    clipped = ((ratio < (1.0 - eps)) | (ratio > (1.0 + eps))).to(mask.dtype)
+    pg_clipfrac = (clipped * mask).sum() / denom
+    ppo_kl = ((-log_ratio) * mask).sum() / denom
+
+    return pg_loss, {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/pg_clipfrac_lower": 0.0,
+    }
+
+
+@register_policy_loss("grpo_lambda")
+def compute_policy_loss_grpo_lambda(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """PPO clipped policy loss for GRPO-λ with internal trace weighting.
+
+    The input ``advantages`` are expected to already include backward λ-trace weighting.
+    """
+    assert config is not None
+
+    eps = config.clip_ratio
+    trace_weighted_advantages = advantages
+    if rollout_is_weights is not None:
+        trace_weighted_advantages = trace_weighted_advantages * rollout_is_weights
+
+    mask = response_mask.to(dtype=log_prob.dtype)
+    log_ratio = torch.clamp(log_prob - old_log_prob, min=-20.0, max=20.0)
+    ratio = torch.exp(log_ratio)
+
+    surr1 = ratio * trace_weighted_advantages
+    surr2 = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * trace_weighted_advantages
+    objective = torch.minimum(surr1, surr2)
+    pg_losses = -objective
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses,
+        loss_mask=mask,
+        loss_agg_mode=loss_agg_mode,
+        **config.global_batch_info,
+    )
+
+    denom = mask.sum().clamp(min=1.0)
+    clipped = ((ratio < (1.0 - eps)) | (ratio > (1.0 + eps))).to(mask.dtype)
+    pg_metrics = {
+        "actor/pg_clipfrac": ((clipped * mask).sum() / denom).detach().item(),
+        "actor/ppo_kl": (((-log_ratio) * mask).sum() / denom).detach().item(),
+        "actor/pg_clipfrac_lower": 0.0,
+    }
+    return pg_loss, pg_metrics
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
