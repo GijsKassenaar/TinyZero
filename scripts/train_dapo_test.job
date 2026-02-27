@@ -25,6 +25,10 @@ unset HIP_VISIBLE_DEVICES
 export HF_HOME=/scratch-shared/$USER/huggingface
 mkdir -p $HF_HOME
 
+export WANDB__SERVICE_WAIT=300
+export WANDB_DIR=/scratch-shared/$USER/wandb
+mkdir -p $WANDB_DIR
+
 cd $HOME/TinyZero
 
 
@@ -32,7 +36,7 @@ export N_GPUS=4
 export ROLLOUT_TP_SIZE=1
 export DATA_DIR=$PWD
 export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-export EXPERIMENT_NAME=test_dapo
+export EXPERIMENT_NAME=test_dapo_75
 
 python3 -m recipe.dapo.main_dapo \
     data.train_files=$DATA_DIR/train.parquet \
@@ -74,7 +78,7 @@ python3 -m recipe.dapo.main_dapo \
     trainer.nnodes=1 \
     trainer.resume_mode=disable \
     trainer.total_training_steps=75 \
-    trainer.save_freq=25 \
+    trainer.save_freq=75 \
     trainer.test_freq=0 \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \

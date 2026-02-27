@@ -26,6 +26,9 @@ unset HIP_VISIBLE_DEVICES
 
 export HF_HOME=/scratch-shared/$USER/huggingface
 mkdir -p $HF_HOME
+export WANDB__SERVICE_WAIT=300
+export WANDB_DIR=/scratch-shared/$USER/wandb
+mkdir -p $WANDB_DIR
 
 cd $HOME/TinyZero
 
