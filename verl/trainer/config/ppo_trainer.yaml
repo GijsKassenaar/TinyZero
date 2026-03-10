@@ -119,6 +119,30 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # LEAD-GRPO configuration
+  lead:
+
+    # Whether to enable LEAD shaping in GRPO
+    enable: False
+
+    # Length z-score decay coefficient for correct answers
+    alpha: 0.1
+
+    # Fixed reward assigned to incorrect answers
+    incorrect_penalty: -1.0
+
+    # Target group accuracy for difficulty-aware weighting
+    tau: 0.5
+
+    # Width of the Gaussian weighting around tau
+    beta: 0.2
+
+    # Numerical stability epsilon used in LEAD computations
+    epsilon: 1e-6
+
+    # Fallback threshold to infer correctness from sequence score
+    correctness_threshold: 0.5
+
 # adaptive window and analysis utilities
 agent:
 
