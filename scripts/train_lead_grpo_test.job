@@ -1,6 +1,6 @@
 #!/bin/bash
-# Stable LEAD-GRPO test job based on the normalphased main_ppo template.
-# 25-step test run with checkpoint saving enabled.
+# Stable LEAD-GRPO continuation job based on the normalphased main_ppo template.
+# Resumes from step-50 checkpoint and trains to step 75 with high rollout window.
 
 #SBATCH --job-name=tinyzero_lead_grpo_stable
 #SBATCH --partition=gpu_h100
@@ -34,9 +34,9 @@ export ROLLOUT_TP_SIZE=1
 export DATA_DIR=$PWD
 export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 export CHECKPOINT_DIR=test_lead_grpo_stable_25
-export RESUME_STEP=25
+export RESUME_STEP=50
 export RESUME_FROM_PATH=$CHECKPOINT_DIR/global_step_$RESUME_STEP
-export EXPERIMENT_NAME=test_lead_grpo_stable_25
+export EXPERIMENT_NAME=test_lead_grpo_stable_50_to_75
 
 if [ ! -d "$RESUME_FROM_PATH" ]; then
     echo "Checkpoint not found: $RESUME_FROM_PATH"
@@ -77,18 +77,18 @@ python3 -m verl.trainer.main_ppo \
     agent.entropy_logging.enable=False \
     agent.adaptive_window.enable=True \
     agent.adaptive_window.mode=phased \
-    agent.adaptive_window.initial_window=1024 \
+    agent.adaptive_window.initial_window=2048 \
     agent.adaptive_window.max_window=2048 \
-    agent.adaptive_window.phased_schedule='[[50,2048]]' \
+    agent.adaptive_window.phased_schedule='[[0,2048]]' \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.resume_mode=resume_path \
     trainer.resume_from_path=$RESUME_FROM_PATH \
     trainer.total_training_steps=75 \
     trainer.save_freq=25 \
-    trainer.test_freq=0 \
-    trainer.val_before_train=True \
-    trainer.val_only=True \
+    trainer.test_freq=1000 \
+    trainer.val_before_train=False \
+    trainer.val_only=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name=TinyZero \
     trainer.experiment_name=$EXPERIMENT_NAME \
