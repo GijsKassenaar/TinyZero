@@ -238,13 +238,28 @@ def compute_advantage(
     elif adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
+        sequence_scores = data.batch["token_level_rewards"].sum(dim=-1)
+        lead_cfg = config.get("lead") if config is not None else None
+        correctness_threshold = 0.5
+        if lead_cfg is not None:
+            correctness_threshold = float(lead_cfg.get("correctness_threshold", correctness_threshold))
+
+        if "acc" in data.non_tensor_batch:
+            is_correct = torch.as_tensor(data.non_tensor_batch["acc"], device=sequence_scores.device, dtype=torch.float32)
+        else:
+            is_correct = (sequence_scores > correctness_threshold).to(dtype=torch.float32)
+
+        response_lengths = grpo_calculation_mask.sum(dim=-1)
 
         # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
+            is_correct=is_correct,
+            response_lengths=response_lengths,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns

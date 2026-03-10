@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "LeadConfig", "RolloutCorrectionConfig"]
 
 
 @dataclass
@@ -54,6 +54,30 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class LeadConfig(BaseConfig):
+    """Configuration for LEAD-style GRPO modifications.
+
+    Args:
+        enable (bool): Whether to enable LEAD shaping in GRPO advantage computation.
+        alpha (float): Length z-score decay coefficient in exp(-alpha * z).
+        incorrect_penalty (float): Sequence reward assigned to incorrect answers.
+        tau (float): Target group accuracy for difficulty-aware weighting.
+        beta (float): Width of Gaussian difficulty-aware weighting.
+        epsilon (float): Numerical stability term for z-score and normalization.
+        correctness_threshold (float): Threshold to infer correctness from sequence reward when no explicit
+            `acc` field is available.
+    """
+
+    enable: bool = False
+    alpha: float = 0.1
+    incorrect_penalty: float = -1.0
+    tau: float = 0.5
+    beta: float = 0.2
+    epsilon: float = 1e-6
+    correctness_threshold: float = 0.5
 
 
 @dataclass
@@ -494,6 +518,7 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    lead: Optional[LeadConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

@@ -267,6 +267,8 @@ def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     index: np.ndarray,
+    is_correct: Optional[torch.Tensor] = None,
+    response_lengths: Optional[torch.Tensor] = None,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -304,15 +306,66 @@ def compute_grpo_outcome_advantage(
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
+    id2weight = {}
+
+    lead_cfg = config.get("lead") if config is not None else None
+    use_lead = lead_cfg is not None and bool(lead_cfg.get("enable", False))
 
     with torch.no_grad():
         bsz = scores.shape[0]
+
+        if use_lead:
+            lead_alpha = float(lead_cfg.get("alpha", 0.1))
+            incorrect_penalty = float(lead_cfg.get("incorrect_penalty", -1.0))
+            lead_tau = float(lead_cfg.get("tau", 0.5))
+            lead_beta = float(lead_cfg.get("beta", 0.2))
+            lead_epsilon = float(lead_cfg.get("epsilon", epsilon))
+            correctness_threshold = float(lead_cfg.get("correctness_threshold", 0.5))
+
+            if response_lengths is None:
+                response_lengths = response_mask.sum(dim=-1)
+            response_lengths = response_lengths.to(device=scores.device, dtype=scores.dtype)
+
+            if is_correct is None:
+                is_correct = (scores > correctness_threshold).to(dtype=scores.dtype)
+            else:
+                is_correct = is_correct.to(device=scores.device, dtype=scores.dtype)
+
+            group_to_indices: dict[Any, list[int]] = defaultdict(list)
+            for i in range(bsz):
+                group_to_indices[index[i]].append(i)
+
+            shaped_scores = torch.empty_like(scores)
+            beta_sq = max(lead_beta * lead_beta, lead_epsilon * lead_epsilon)
+
+            for group_id, group_indices in group_to_indices.items():
+                group_idx_tensor = torch.as_tensor(group_indices, device=scores.device, dtype=torch.long)
+                group_lengths = response_lengths[group_idx_tensor]
+                group_correct = is_correct[group_idx_tensor]
+
+                mean_len = group_lengths.mean()
+                std_len = torch.std(group_lengths, unbiased=False)
+                z = (group_lengths - mean_len) / (std_len + lead_epsilon)
+
+                group_rewards = torch.where(
+                    group_correct > 0.5,
+                    torch.exp(-lead_alpha * z),
+                    torch.full_like(z, incorrect_penalty),
+                )
+                shaped_scores[group_idx_tensor] = group_rewards
+
+                acc_avg = group_correct.mean()
+                weight = torch.exp(-((acc_avg - lead_tau) ** 2) / (2.0 * beta_sq))
+                id2weight[group_id] = weight
+
+            scores = shaped_scores
+
         for i in range(bsz):
             id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
+                id2mean[idx] = scores.new_tensor(0.0)
+                id2std[idx] = scores.new_tensor(1.0)
             elif len(id2score[idx]) > 1:
                 scores_tensor = torch.stack(id2score[idx])
                 id2mean[idx] = torch.mean(scores_tensor)
@@ -324,6 +377,8 @@ def compute_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
+            if use_lead:
+                scores[i] = scores[i] * id2weight[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
