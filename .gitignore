@@ -114,3 +114,16 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 
 test.ipynb
 outputs_Gijs/
+
+# Slurm job outputs
+slurm-*.out
+slurm-*.err
+
+# Root-level training run directories used for saved checkpoints
+test_*/
+checkpoints/
+outputs/
+test.parquet
+test.parquet
+train.parquet
+test.parquet

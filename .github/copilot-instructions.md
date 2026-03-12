@@ -64,7 +64,7 @@ python examples/data_preprocess/countdown.py --local_dir ./data
 ```
 
 ### Training Modes
-Scripts follow the pattern: `.sh` has the `python3 -m verl.trainer.main_ppo` command; `.job` has SLURM headers + env vars + calls the `.sh`.
+Scripts are mixed: most current experiment launchers are self-contained `.job` files, while some older launchers still keep the `python3 -m verl.trainer.main_ppo` command in a companion `.sh`.
 
 | Mode | Script | Key overrides |
 |------|--------|---------------|
@@ -72,7 +72,7 @@ Scripts follow the pattern: `.sh` has the `python3 -m verl.trainer.main_ppo` com
 | Full rollout baseline | `train_tiny_zero.sh` | Fixed `data.max_response_length=4096` |
 | Vanilla fixed-length | `train_tiny_zero_vanilla.sh` | `agent.adaptive_window.enable=False` |
 | Phased schedule | `train_tiny_zero_phased_schedule.sh` | `agent.adaptive_window.mode=phased` |
-| S-GRPO | `train_tiny_zero_sgrpo.sh` | `algorithm.sgrpo.enable=True` |
+| S-GRPO | `train_tiny_zero_sgrpo.job` | `algorithm.sgrpo.enable=True` |
 
 **Env vars** set before running: `N_GPUS`, `ROLLOUT_TP_SIZE` (must divide N_GPUS), `BASE_MODEL`, `DATA_DIR`, `EXPERIMENT_NAME`.
 
