@@ -143,6 +143,27 @@ algorithm:
     # Fallback threshold to infer correctness from sequence score
     correctness_threshold: 0.5
 
+  # Serial-Group Decaying-Reward Policy Optimization configuration
+  sgrpo:
+
+    # Enable S-GRPO two-phase serial-group generation
+    enable: False
+
+    # PPO steps to run before enabling S-GRPO serial exits
+    warmup_steps: 0
+
+    # Number of exits per prompt, including the full response
+    num_exits: 4
+
+    # Reward decay factor applied to later exits
+    decay_factor: 2.0
+
+    # Exit placement strategy for intermediate truncation points
+    exit_method: uniform
+
+    # Prompt appended to truncated reasoning before continuation generation
+    answer_inducer: "Time is limited, stop thinking and start answering.\n</think>\n<answer>"
+
 # adaptive window and analysis utilities
 agent:
 
