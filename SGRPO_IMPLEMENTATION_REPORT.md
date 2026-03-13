@@ -107,9 +107,9 @@ When the trainer starts, it reads `algorithm.sgrpo` and constructs `SGRPOControl
 
 Important constraint:
 
-- S-GRPO requires `actor_rollout_ref.rollout.n = 1`
+- once S-GRPO is active, the trainer uses one base rollout internally and then expands it into serial exits
 
-That requirement exists because S-GRPO already expands one prompt into multiple exits internally. It does not stack cleanly with standard multi-sample rollout replication.
+That means the normal `actor_rollout_ref.rollout.n` setting is used for warmup GRPO behavior, not for the active S-GRPO phase.
 
 ## 3. Exit Placement
 
@@ -312,6 +312,7 @@ The trainer also logs:
 - `sgrpo/active`
 - `sgrpo/warmup_steps`
 - `sgrpo/warmup_steps_remaining`
+- `sgrpo/current_rollout_repeat_times`
 
 ## 10. Warmup Implementation
 
@@ -332,25 +333,27 @@ If `warmup_steps = 30`:
 
 ### What happens during warmup
 
-Warmup still uses:
+Warmup now behaves like normal GRPO even though the run is configured as an S-GRPO job overall.
 
-- `algorithm.adv_estimator = sgrpo`
-- `actor_rollout_ref.rollout.n = 1`
+The important distinction is:
 
-But it does **not** perform the second S-GRPO continuation pass yet.
+- the warmup phase uses the normal `actor_rollout_ref.rollout.n`
+- once S-GRPO becomes active, the trainer always uses one base rollout internally before creating serial exits
+
+So warmup does **not** perform the second S-GRPO continuation pass yet.
 
 Instead:
 
-1. One normal rollout is generated per prompt.
+1. `actor_rollout_ref.rollout.n` normal rollouts are generated per prompt.
 2. No serial-group expansion happens.
 3. No real `exit_order` tensor exists.
-4. In `compute_advantage(...)`, the trainer injects `exit_order = 1` for all samples.
+4. The trainer switches the effective advantage estimator to GRPO for that step.
 
-That means warmup behaves like a degenerate one-exit version of S-GRPO:
+That means warmup behaves like ordinary GRPO before the S-GRPO phase begins:
 
 - no exit decay penalty yet
 - no second continuation pass yet
-- same estimator path and config plumbing
+- group normalization happens across the normal `rollout.n` samples, as in GRPO
 
 This design keeps the switch clean because the training loop, config, and optimizer path remain the same before and after activation.
 
@@ -420,6 +423,10 @@ By default it sets:
 
 `SGRPO_WARMUP_STEPS=30`
 
+and uses:
+
+`actor_rollout_ref.rollout.n=4`
+
 So you can run:
 
 ```bash
@@ -444,4 +451,4 @@ The current S-GRPO implementation is best understood as:
 
 Warmup delays steps 2 through 4 while keeping the rest of the training path consistent.
 
-That means the system starts as a simple one-sample rollout regime and later upgrades into full S-GRPO without changing the overall training framework.
+That means the system starts with normal GRPO-style multi-sample warmup (using configured `rollout.n`) and later upgrades into full S-GRPO without changing the overall training framework.

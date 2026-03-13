@@ -41,6 +41,7 @@ from verl.utils.chat_template import initialize_system_prompt
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import get_event_loop
 from verl.utils.rollout_trace import (
     RolloutTraceConfig,
@@ -471,9 +472,14 @@ class AgentLoopWorkerBase:
         )
 
         tasks = []
+        prefilled_prompt_mode = bool(batch.meta_info.get("prefilled_prompt_mode", False)) if batch.meta_info else False
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            if prefilled_prompt_mode:
+                kwargs["prefilled_prompt_ids"] = batch.batch["input_ids"][i]
+                kwargs["prefilled_attention_mask"] = batch.batch["attention_mask"][i]
+                kwargs["target_prompt_length"] = batch.batch["input_ids"].shape[1]
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -494,6 +500,9 @@ class AgentLoopWorkerBase:
         trace: bool = True,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
+        if "prefilled_prompt_ids" in kwargs:
+            return await self._run_prefilled_prompt(sampling_params, **kwargs)
+
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -519,9 +528,38 @@ class AgentLoopWorkerBase:
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, **kwargs)
 
+    async def _run_prefilled_prompt(self, sampling_params: dict[str, Any], **kwargs) -> _InternalAgentLoopOutput:
+        """Generate from already-tokenized prompt ids without running a chat agent loop."""
+        prompt_ids_tensor = kwargs["prefilled_prompt_ids"]
+        attention_mask_tensor = kwargs["prefilled_attention_mask"]
+        valid_prompt_ids = prompt_ids_tensor[attention_mask_tensor.bool()].tolist()
+
+        metrics = {}
+        with simple_timer("generate_sequences", metrics):
+            output = await self.server_manager.generate(
+                request_id=uuid4().hex,
+                prompt_ids=valid_prompt_ids,
+                sampling_params=sampling_params,
+            )
+
+        response_mask = [1] * len(output.token_ids)
+        agent_output = AgentLoopOutput(
+            prompt_ids=valid_prompt_ids,
+            response_ids=output.token_ids,
+            response_mask=response_mask,
+            response_logprobs=output.log_probs,
+            routed_experts=output.routed_experts,
+            multi_modal_data={},
+            num_turns=1,
+            metrics=metrics,
+            extra_fields={"target_prompt_length": int(kwargs["target_prompt_length"])},
+        )
+        return await self._agent_loop_postprocess(agent_output, **kwargs)
+
     async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
-        output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+        if "raw_prompt" in kwargs:
+            output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
 
@@ -545,10 +583,11 @@ class AgentLoopWorkerBase:
 
         # TODO(wuxibin): remove padding and use tensordict.
         self.tokenizer.padding_side = "left"
+        prompt_pad_length = int(output.extra_fields.get("target_prompt_length", self.config.actor_rollout_ref.rollout.prompt_length))
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
             padding="max_length",
-            max_length=self.config.actor_rollout_ref.rollout.prompt_length,
+            max_length=prompt_pad_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -692,6 +731,9 @@ class AgentLoopWorkerBase:
 
     async def _compute_score(self, output, prompts, responses, attention_mask, input_ids, position_ids, kwargs):
         """Compute reward score for single sample."""
+        if kwargs.get("__skip_reward_compute__", False):
+            return
+
         enable_async_reward = (
             self.reward_router_address is not None and self.config.reward_model.enable_resource_pool
         ) or not self.config.reward_model.enable

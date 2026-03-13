@@ -447,20 +447,28 @@ def compute_group_success_metrics(batch: DataProto, correct_mask: torch.Tensor) 
     """
     uids = batch.non_tensor_batch["uid"]
 
-    # Group correctness by UID
+    # Group correctness and response lengths by UID
     uid_to_correct = defaultdict(list)
+    response_info = _compute_response_info(batch)
+    response_lengths = response_info["response_length"]
+    uid_to_response_lengths = defaultdict(list)
 
     for i, uid in enumerate(uids):
         is_correct = correct_mask[i].item() if torch.is_tensor(correct_mask[i]) else correct_mask[i]
         uid_to_correct[uid].append(is_correct)
+        uid_to_response_lengths[uid].append(float(response_lengths[i].item()))
 
-    # Count groups by number of correct answers
+    # Count groups by number of correct answers and collect group-mean response lengths.
     group_counts = defaultdict(int)
+    group_mean_lengths_by_correct = defaultdict(list)
     total_groups = len(uid_to_correct)
 
     for uid, correctness_list in uid_to_correct.items():
         num_correct = sum(correctness_list)
         group_counts[num_correct] += 1
+        group_lengths = uid_to_response_lengths[uid]
+        if len(group_lengths) > 0:
+            group_mean_lengths_by_correct[num_correct].append(float(np.mean(group_lengths)))
 
     if total_groups == 0:
         return {}
@@ -474,6 +482,10 @@ def compute_group_success_metrics(batch: DataProto, correct_mask: torch.Tensor) 
         count = group_counts.get(i, 0)
         percentage = 100.0 * count / total_groups
         metrics[f"completion/group_{i}of{max_group_size}_correct_pct"] = percentage
+        group_mean_lengths = group_mean_lengths_by_correct.get(i, [])
+        metrics[f"completion/group_{i}of{max_group_size}_mean_response_length"] = (
+            float(np.mean(group_mean_lengths)) if len(group_mean_lengths) > 0 else 0.0
+        )
 
     return metrics
 

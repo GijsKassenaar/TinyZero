@@ -17,7 +17,14 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "LeadConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "LeadConfig",
+    "RolloutCorrectionConfig",
+    "SGRPOConfig",
+]
 
 
 @dataclass
@@ -78,6 +85,27 @@ class LeadConfig(BaseConfig):
     beta: float = 0.2
     epsilon: float = 1e-6
     correctness_threshold: float = 0.5
+
+
+@dataclass
+class SGRPOConfig(BaseConfig):
+    """Configuration for Serial-Group Decaying-Reward Policy Optimization.
+
+    Args:
+        enable (bool): Whether to enable S-GRPO two-phase serial-group generation.
+        warmup_steps (int): Number of PPO steps to run before enabling S-GRPO serial exits.
+        num_exits (int): Number of exits per prompt, including the full response.
+        decay_factor (float): Reward decay factor applied to later exits.
+        exit_method (str): Strategy used to place intermediate exits.
+        answer_inducer (str): Prompt appended to truncated reasoning before continuation generation.
+    """
+
+    enable: bool = False
+    warmup_steps: int = 0
+    num_exits: int = 4
+    decay_factor: float = 2.0
+    exit_method: str = "uniform"
+    answer_inducer: str = "Time is limited, stop thinking and start answering.\n</think>\n<answer>"
 
 
 @dataclass
@@ -492,6 +520,7 @@ class AlgoConfig(BaseConfig):
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
+        sgrpo (Optional[SGRPOConfig]): S-GRPO two-phase serial-group generation settings.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
             Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
 
@@ -519,6 +548,7 @@ class AlgoConfig(BaseConfig):
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
     lead: Optional[LeadConfig] = None
+    sgrpo: Optional[SGRPOConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

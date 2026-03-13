@@ -10,6 +10,7 @@ Two-phase generation:
 from dataclasses import dataclass
 from typing import List, Tuple, Callable, Optional, Dict
 
+import numpy as np
 import torch
 from tensordict import TensorDict
 from verl import DataProto
@@ -19,6 +20,7 @@ from verl import DataProto
 class SGRPOConfig:
     """S-GRPO configuration."""
     enable: bool = False
+    warmup_steps: int = 0
     num_exits: int = 4
     decay_factor: float = 2.0  # Reward divided by this for each later exit
     exit_method: str = "uniform"  # Only uniform supported for now
@@ -30,10 +32,10 @@ def get_uniform_exit_positions(response: torch.Tensor, num_exits: int, eos_token
     # Find actual sequence length (up to EOS)
     eos_positions = (response == eos_token_id).nonzero(as_tuple=True)[0]
     length = eos_positions[0].item() + 1 if len(eos_positions) > 0 else len(response)
-    
-    if length < num_exits:
-        return list(range(1, length + 1))
-    
+
+    if length <= 0:
+        return [1] * num_exits
+
     return [max(1, min(int(length * (i + 1) / num_exits), length)) for i in range(num_exits)]
 
 
@@ -67,7 +69,7 @@ class SGRPOController:
         Phase 2 (here): Create truncated prompts, generate continuations, combine
         """
         # Prepare truncated prompts
-        truncated_prompts, exit_positions, orig_indices = self._prepare_truncated_prompts(full_responses)
+        truncated_prompts, exit_positions = self._prepare_truncated_prompts(full_responses)
         
         # Generate continuations
         truncated_continuations = None
@@ -78,7 +80,7 @@ class SGRPOController:
         # Combine into serial group
         return self._combine_serial_group(full_responses, truncated_continuations, exit_positions)
     
-    def _prepare_truncated_prompts(self, full_responses: DataProto) -> Tuple[Optional[DataProto], List[List[int]], List[int]]:
+    def _prepare_truncated_prompts(self, full_responses: DataProto) -> Tuple[Optional[DataProto], List[List[int]]]:
         """Create truncated prompts for Phase 2 generation."""
         batch_size = len(full_responses.batch['responses'])
         num_exits = self.config.num_exits
@@ -86,12 +88,12 @@ class SGRPOController:
         prompts = full_responses.batch['prompts']
         responses = full_responses.batch['responses']
         device = prompts.device
+        inducer = torch.tensor(self.inducer_tokens, dtype=responses.dtype, device=device)
         
         all_input_ids = []
         all_attn_masks = []
         all_pos_ids = []
         all_exit_positions = []
-        all_orig_indices = []
         
         for batch_idx in range(batch_size):
             response = responses[batch_idx]
@@ -105,17 +107,15 @@ class SGRPOController:
                 exit_pos = exit_positions[exit_idx]
                 
                 partial = response[:exit_pos]
-                inducer = torch.tensor(self.inducer_tokens, dtype=response.dtype, device=device)
                 truncated = torch.cat([prompt, partial, inducer], dim=0)
                 
                 length = len(truncated)
                 all_input_ids.append(truncated)
                 all_attn_masks.append(torch.ones(length, dtype=torch.long, device=device))
                 all_pos_ids.append(torch.arange(length, dtype=torch.long, device=device))
-                all_orig_indices.append(batch_idx)
         
         if not all_input_ids:
-            return None, all_exit_positions, []
+            return None, all_exit_positions
         
         # Pad to same length (left-pad)
         max_len = max(len(t) for t in all_input_ids)
@@ -149,11 +149,15 @@ class SGRPOController:
         
         truncated_data = DataProto(
             batch=truncated_batch,
-            non_tensor_batch={},
-            meta_info=full_responses.meta_info.copy() if hasattr(full_responses, 'meta_info') else {}
+            non_tensor_batch={
+                '__skip_reward_compute__': np.ones(len(all_input_ids), dtype=bool),
+            },
+            meta_info=(full_responses.meta_info.copy() if hasattr(full_responses, 'meta_info') else {}) | {
+                'prefilled_prompt_mode': True,
+            }
         )
-        
-        return truncated_data, all_exit_positions, all_orig_indices
+
+        return truncated_data, all_exit_positions
     
     def _combine_serial_group(
         self,
@@ -173,6 +177,7 @@ class SGRPOController:
         
         prompt_len = prompts.shape[1]
         resp_len = full_resp.shape[1]
+        inducer = torch.tensor(self.inducer_tokens, dtype=full_resp.dtype, device=device)
         
         all_input_ids = []
         all_responses = []
@@ -204,7 +209,6 @@ class SGRPOController:
                     if truncated_continuations is not None:
                         cont = truncated_continuations.batch['responses'][truncated_idx]
                         partial = orig_resp[:exit_pos]
-                        inducer = torch.tensor(self.inducer_tokens, dtype=orig_resp.dtype, device=device)
                         
                         combined = torch.cat([partial, inducer, cont], dim=0)
                         
@@ -242,9 +246,22 @@ class SGRPOController:
         if 'position_ids' in full_responses.batch.keys():
             serial_batch['position_ids'] = self._make_position_ids(serial_batch['attention_mask'])
         
+        serial_non_tensor = {}
+        for key, values in full_responses.non_tensor_batch.items():
+            if isinstance(values, np.ndarray) and values.dtype != object:
+                serial_non_tensor[key] = np.repeat(values, num_exits, axis=0)
+            else:
+                repeated = []
+                for batch_idx in range(batch_size):
+                    for _ in range(num_exits):
+                        repeated.append(values[batch_idx])
+                repeated_arr = np.empty(len(repeated), dtype=object)
+                repeated_arr[:] = repeated
+                serial_non_tensor[key] = repeated_arr
+
         serial_data = DataProto(
             batch=serial_batch,
-            non_tensor_batch={},
+            non_tensor_batch=serial_non_tensor,
             meta_info=full_responses.meta_info.copy() if hasattr(full_responses, 'meta_info') else {}
         )
         

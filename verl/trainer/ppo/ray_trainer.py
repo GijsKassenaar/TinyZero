@@ -54,6 +54,7 @@ from verl.trainer.ppo.metric_utils import (
     save_entropy_data,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.trainer.ppo.sgrpo import SGRPOConfig, SGRPOController
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
@@ -285,6 +286,14 @@ def compute_advantage(
         }
         if "uid" in data.non_tensor_batch:  # optional
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
+        if "exit_order" in data.batch:  # optional
+            adv_kwargs["exit_order"] = data.batch["exit_order"]
+        elif adv_estimator == AdvantageEstimator.SGRPO:
+            adv_kwargs["exit_order"] = torch.ones(
+                data.batch["token_level_rewards"].shape[0],
+                dtype=torch.long,
+                device=data.batch["token_level_rewards"].device,
+            )
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
 
@@ -390,6 +399,16 @@ class RayPPOTrainer:
             aw_config = AdaptiveSuccessWindowConfig(**adaptive_cfg_dict)
             self._adaptive_window = AdaptiveSuccessWindowController(config=aw_config)
 
+        self._sgrpo_controller: Optional[SGRPOController] = None
+        sgrpo_cfg = OmegaConf.select(self.config, "algorithm.sgrpo")
+        if sgrpo_cfg is not None and sgrpo_cfg.get("enable", False):
+            sgrpo_cfg_dict = OmegaConf.to_container(sgrpo_cfg, resolve=True)
+            self._sgrpo_controller = SGRPOController(
+                config=SGRPOConfig(**sgrpo_cfg_dict),
+                tokenizer=tokenizer,
+                max_response_length=int(self.config.data.max_response_length),
+            )
+
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -475,6 +494,22 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _is_sgrpo_active(self) -> bool:
+        if self._sgrpo_controller is None:
+            return False
+        return self.global_steps >= int(self._sgrpo_controller.config.warmup_steps)
+
+    def _get_sgrpo_rollout_repeat_times(self, sgrpo_active: bool) -> int:
+        if self._sgrpo_controller is not None and sgrpo_active:
+            return 1
+        return int(self.config.actor_rollout_ref.rollout.n)
+
+    def _get_adv_estimator_for_step(self, sgrpo_active: bool) -> AdvantageEstimator:
+        adv_estimator = self.config.algorithm.adv_estimator
+        if self._sgrpo_controller is not None and not sgrpo_active and adv_estimator == AdvantageEstimator.SGRPO:
+            return AdvantageEstimator.GRPO
+        return adv_estimator
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -686,8 +721,6 @@ class RayPPOTrainer:
                 "validate": True,
                 "global_steps": self.global_steps,
             }
-            if self._adaptive_window is not None:
-                test_gen_batch.meta_info.setdefault("max_tokens", int(self._adaptive_window.get_window_size()))
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
@@ -1249,6 +1282,7 @@ class RayPPOTrainer:
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
+        rollout_repeat_times = int(batch.meta_info.get("rollout_repeat_times", self.config.actor_rollout_ref.rollout.n))
         # update actor
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
@@ -1256,7 +1290,7 @@ class RayPPOTrainer:
             batch_td = left_right_2_no_padding(batch_td)
             calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
             ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+            ppo_mini_batch_size = ppo_mini_batch_size * rollout_repeat_times
             ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
             seed = self.config.actor_rollout_ref.actor.data_loader_seed
             shuffle = self.config.actor_rollout_ref.actor.shuffle
@@ -1281,12 +1315,13 @@ class RayPPOTrainer:
         return actor_output
 
     def _update_critic(self, batch: DataProto) -> DataProto:
+        rollout_repeat_times = int(batch.meta_info.get("rollout_repeat_times", self.config.actor_rollout_ref.rollout.n))
         if self.use_legacy_worker_impl == "disable":
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
             ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
-            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+            ppo_mini_batch_size = ppo_mini_batch_size * rollout_repeat_times
             ppo_epochs = self.config.critic.ppo_epochs
             seed = self.config.critic.data_loader_seed
             shuffle = self.config.critic.shuffle
@@ -1400,9 +1435,22 @@ class RayPPOTrainer:
 
                     # pass global_steps to trace
                     gen_batch.meta_info["global_steps"] = self.global_steps
-                    gen_batch_output = gen_batch.repeat(
-                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                    )
+                    sgrpo_active = self._is_sgrpo_active()
+                    current_adv_estimator = self._get_adv_estimator_for_step(sgrpo_active)
+                    current_rollout_repeat_times = self._get_sgrpo_rollout_repeat_times(sgrpo_active)
+                    metrics["sgrpo/active"] = float(sgrpo_active)
+                    if self._sgrpo_controller is not None:
+                        warmup_steps = int(self._sgrpo_controller.config.warmup_steps)
+                        metrics["sgrpo/warmup_steps"] = warmup_steps
+                        metrics["sgrpo/warmup_steps_remaining"] = max(0, warmup_steps - self.global_steps)
+                    metrics["sgrpo/current_rollout_repeat_times"] = current_rollout_repeat_times
+
+                    if not sgrpo_active:
+                        gen_batch_output = gen_batch.repeat(
+                            repeat_times=current_rollout_repeat_times, interleave=True
+                        )
+                    else:
+                        gen_batch_output = gen_batch
 
                     is_last_step = self.global_steps >= self.total_training_steps
                     with marked_timer("step", timing_raw):
@@ -1416,7 +1464,19 @@ class RayPPOTrainer:
                             timing_raw.update(gen_batch_output.meta_info["timing"])
                             gen_batch_output.meta_info.pop("timing", None)
 
-                        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                            if sgrpo_active:
+                                if not self.async_rollout_mode:
+                                    generate_fn = self.actor_rollout_wg.generate_sequences
+                                else:
+                                    generate_fn = self.async_rollout_manager.generate_sequences
+                                gen_batch_output, exit_orders = self._sgrpo_controller.create_serial_group_two_phase(
+                                    full_responses=gen_batch_output,
+                                    generate_fn=generate_fn,
+                                )
+                            else:
+                                exit_orders = None
+
+                        if current_adv_estimator == AdvantageEstimator.REMAX:
                             if self.reward_fn is None:
                                 raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
@@ -1451,9 +1511,15 @@ class RayPPOTrainer:
                                 batch.batch["reward_baselines"] = reward_baseline_tensor
 
                                 del rm_scores, gen_baseline_batch, gen_baseline_output
-                        # repeat to align with repeated responses in rollout
-                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        if sgrpo_active:
+                            batch.meta_info["rollout_repeat_times"] = 1
+                            batch = batch.repeat(repeat_times=self._sgrpo_controller.config.num_exits, interleave=True)
+                        else:
+                            batch.meta_info["rollout_repeat_times"] = current_rollout_repeat_times
+                            batch = batch.repeat(repeat_times=current_rollout_repeat_times, interleave=True)
                         batch = batch.union(gen_batch_output)
+                        if exit_orders is not None:
+                            batch.batch["exit_order"] = exit_orders
 
                         if "response_mask" not in batch.batch.keys():
                             batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1570,6 +1636,13 @@ class RayPPOTrainer:
                                 )
                                 metrics.update(aw_metrics)
 
+                            if sgrpo_active and "exit_order" in batch.batch:
+                                sgrpo_metrics = self._sgrpo_controller.update_statistics(
+                                    rewards=batch.batch["token_level_rewards"],
+                                    exit_orders=batch.batch["exit_order"],
+                                )
+                                metrics.update(sgrpo_metrics)
+
                             # Compute rollout correction: IS weights, rejection sampling, and metrics
                             # Only runs in decoupled mode (computes once per batch using stable π_old)
                             # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
@@ -1592,10 +1665,10 @@ class RayPPOTrainer:
 
                             batch = compute_advantage(
                                 batch,
-                                adv_estimator=self.config.algorithm.adv_estimator,
+                                adv_estimator=current_adv_estimator,
                                 gamma=self.config.algorithm.gamma,
                                 lam=self.config.algorithm.lam,
-                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                num_repeat=current_rollout_repeat_times,
                                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                 config=self.config.algorithm,
                             )

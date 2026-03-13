@@ -96,6 +96,7 @@ class AdvantageEstimator(str, Enum):
 
     GAE = "gae"
     GRPO = "grpo"
+    SGRPO = "sgrpo"
     GRPO_LAMBDA = "grpo_lambda"
     REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
@@ -382,6 +383,57 @@ def compute_grpo_outcome_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_adv_est("sgrpo")
+def compute_sgrpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    exit_order: torch.Tensor,
+    decay_factor: float = 2.0,
+    epsilon: float = 1e-6,
+    config: Optional[AlgoConfig] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute S-GRPO outcome advantages with exit-dependent reward decay."""
+    del config, kwargs
+
+    scores = token_level_rewards.sum(dim=-1)
+    exit_order = exit_order.to(device=scores.device, dtype=scores.dtype)
+
+    decay_divisor = torch.pow(scores.new_tensor(decay_factor), exit_order - 1)
+    decayed_scores = torch.where(scores > 0.5, scores / decay_divisor, torch.zeros_like(scores))
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = decayed_scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(decayed_scores[i])
+
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = decayed_scores.new_tensor(0.0)
+                id2std[idx] = decayed_scores.new_tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+                if id2std[idx] < epsilon:
+                    id2std[idx] = decayed_scores.new_tensor(1.0)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+        normalized_scores = decayed_scores.clone()
+        for i in range(bsz):
+            normalized_scores[i] = (decayed_scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+
+        advantages = normalized_scores.unsqueeze(-1) * response_mask
+
+    return advantages, advantages
 
 
 def compute_grpo_lambda_advantages(
