@@ -311,8 +311,6 @@ The trainer also logs:
 
 - `sgrpo/active`
 - `sgrpo/warmup_steps`
-- `sgrpo/warmup_steps_remaining`
-- `sgrpo/current_rollout_repeat_times`
 
 ## 10. Warmup Implementation
 
@@ -326,10 +324,10 @@ The warmup parameter is:
 
 ### Exact behavior
 
-If `warmup_steps = 30`:
+If `warmup_steps = 50`:
 
-- steps `0` through `29`: warmup mode
-- step `30` onward: S-GRPO serial exits are active
+- steps `0` through `49`: warmup mode
+- step `50` onward: S-GRPO serial exits are active
 
 ### What happens during warmup
 
@@ -419,13 +417,22 @@ Runs S-GRPO immediately.
 
 Runs warmup first, then activates S-GRPO.
 
+This launcher also enables adaptive window in `phased` mode with schedule:
+
+- steps `0..49`: `max_tokens = 1024`
+- step `50+`: `max_tokens = 2048`
+
 By default it sets:
 
-`SGRPO_WARMUP_STEPS=30`
+`SGRPO_WARMUP_STEPS=50`
 
 and uses:
 
 `actor_rollout_ref.rollout.n=4`
+
+and
+
+`ADAPTIVE_WINDOW_SCHEDULE=[[0,1024],[50,2048]]`
 
 So you can run:
 

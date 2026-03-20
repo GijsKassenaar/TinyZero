@@ -20,6 +20,7 @@ from verl.base_config import BaseConfig
 __all__ = [
     "AlgoConfig",
     "FilterGroupsConfig",
+    "HybridBranchConfig",
     "KLControlConfig",
     "LeadConfig",
     "RolloutCorrectionConfig",
@@ -106,6 +107,23 @@ class SGRPOConfig(BaseConfig):
     decay_factor: float = 2.0
     exit_method: str = "uniform"
     answer_inducer: str = "Time is limited, stop thinking and start answering.\n</think>\n<answer>"
+
+
+@dataclass
+class HybridBranchConfig(BaseConfig):
+    """Configuration for hybrid S-GRPO/GRPO branching.
+
+    Args:
+        enable (bool): Whether to enable hybrid branching during active S-GRPO phase.
+        correct_threshold (float): First-pass sequence reward threshold for routing to S-GRPO branch.
+        incorrect_extra_rollouts (int): Number of additional full rollouts for incorrect prompts.
+        tag_key (str): non_tensor_batch key used to store per-sample branch identity.
+    """
+
+    enable: bool = False
+    correct_threshold: float = 0.5
+    incorrect_extra_rollouts: int = 3
+    tag_key: str = "branch_mode"
 
 
 @dataclass
@@ -521,6 +539,7 @@ class AlgoConfig(BaseConfig):
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
         sgrpo (Optional[SGRPOConfig]): S-GRPO two-phase serial-group generation settings.
+        hybrid_branch (Optional[HybridBranchConfig]): Hybrid branch routing settings for active S-GRPO.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
             Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
 
@@ -549,6 +568,7 @@ class AlgoConfig(BaseConfig):
     filter_groups: Optional[FilterGroupsConfig] = None
     lead: Optional[LeadConfig] = None
     sgrpo: Optional[SGRPOConfig] = None
+    hybrid_branch: Optional[HybridBranchConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

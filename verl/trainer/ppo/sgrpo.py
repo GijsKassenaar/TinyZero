@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 from verl import DataProto
+from verl.protocol import DataProtoConfig
 
 
 @dataclass
@@ -156,6 +157,8 @@ class SGRPOController:
                 'prefilled_prompt_mode': True,
             }
         )
+        # Allow rollout workers to chunk uneven continuation batches safely.
+        truncated_data.meta_info[DataProtoConfig.auto_padding_key] = True
 
         return truncated_data, all_exit_positions
     
@@ -300,7 +303,12 @@ class SGRPOController:
         
         return pos_ids
     
-    def update_statistics(self, rewards: torch.Tensor, exit_orders: torch.Tensor) -> Dict[str, float]:
+    def update_statistics(
+        self,
+        rewards: torch.Tensor,
+        exit_orders: torch.Tensor,
+        response_mask: Optional[torch.Tensor] = None,
+    ) -> Dict[str, float]:
         """Update stats and return metrics for logging."""
         if rewards.dim() == 2:
             rewards = rewards.sum(dim=-1)
@@ -323,6 +331,12 @@ class SGRPOController:
         correct_exits = exit_orders[is_correct].float()
         if len(correct_exits) > 0:
             metrics["sgrpo/avg_correct_exit_position"] = correct_exits.mean().item()
+
+        if response_mask is not None and self.config.num_exits >= 4:
+            response_lengths = response_mask.sum(dim=-1).float()
+            exit4_mask = exit_orders == 4
+            if torch.any(exit4_mask):
+                metrics["sgrpo/exit_4_response_length_mean"] = response_lengths[exit4_mask].mean().item()
         
         if self.total_samples > 0:
             metrics["sgrpo/overall_accuracy"] = sum(self.correct_by_exit.values()) / self.total_samples

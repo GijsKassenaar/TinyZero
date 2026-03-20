@@ -37,7 +37,7 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.protocol import DataProtoConfig, pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
@@ -304,6 +304,120 @@ def compute_advantage(
     return data
 
 
+def _split_dataproto_by_mask(data: DataProto, mask: np.ndarray) -> tuple[DataProto, DataProto]:
+    """Split DataProto into (mask=True subset, mask=False subset)."""
+    if mask.dtype != bool:
+        raise ValueError(f"Expected boolean mask, got dtype={mask.dtype}")
+    if len(mask) != len(data):
+        raise ValueError(f"Mask length {len(mask)} does not match batch length {len(data)}")
+    return data.select_idxs(mask), data.select_idxs(~mask)
+
+
+def _concat_dataprotos_non_empty(chunks: list[DataProto]) -> DataProto:
+    """Concatenate only non-empty DataProto chunks, aligning schemas across chunks first."""
+    non_empty = [chunk for chunk in chunks if len(chunk) > 0]
+    if not non_empty:
+        return chunks[0][:0]
+    if len(non_empty) == 1:
+        return non_empty[0]
+
+    # DataProto.concat requires identical tensor and non-tensor key schemas.
+    # Hybrid branches can differ in optional keys (e.g., rm_scores/response_mask),
+    # so we align by intersecting keys present in every chunk.
+    common_batch_keys = None
+    common_non_tensor_keys = None
+    for chunk in non_empty:
+        batch_keys = set(chunk.batch.keys()) if chunk.batch is not None else set()
+        non_tensor_keys = set(chunk.non_tensor_batch.keys())
+        if common_batch_keys is None:
+            common_batch_keys = batch_keys
+            common_non_tensor_keys = non_tensor_keys
+        else:
+            common_batch_keys &= batch_keys
+            common_non_tensor_keys &= non_tensor_keys
+
+    aligned = [
+        chunk.select(
+            batch_keys=sorted(common_batch_keys) if common_batch_keys else [],
+            non_tensor_batch_keys=sorted(common_non_tensor_keys) if common_non_tensor_keys else [],
+        )
+        for chunk in non_empty
+    ]
+    return DataProto.concat(aligned)
+
+
+def _attach_branch_tag(data: DataProto, tag_key: str, tag_value: str) -> DataProto:
+    """Attach per-sample branch identity into non_tensor_batch."""
+    data.non_tensor_batch[tag_key] = np.full((len(data),), tag_value, dtype=object)
+    return data
+
+
+def compute_hybrid_branch_advantages(
+    data: DataProto,
+    tag_key: str,
+    gamma: float,
+    lam: float,
+    norm_adv_by_std_in_grpo: bool,
+    config: AlgoConfig,
+) -> DataProto:
+    """Compute S-GRPO and GRPO advantages on their own branch subsets, then merge in-place."""
+    if tag_key not in data.non_tensor_batch:
+        raise ValueError(f"Branch tag key '{tag_key}' missing from non_tensor_batch")
+
+    branch_tags = data.non_tensor_batch[tag_key]
+    sgrpo_mask_np = np.asarray(branch_tags == "sgrpo")
+    grpo_mask_np = np.asarray(branch_tags == "grpo")
+
+    if len(sgrpo_mask_np) != len(data):
+        raise ValueError("Branch tag array length does not match batch length")
+
+    covered_mask_np = np.asarray(sgrpo_mask_np | grpo_mask_np)
+    if not np.all(covered_mask_np):
+        unknown_count = int((~covered_mask_np).sum())
+        raise ValueError(
+            "Hybrid branch tags must be either 'sgrpo' or 'grpo' for every row; "
+            f"found {unknown_count} rows with unknown tags"
+        )
+
+    if not np.any(sgrpo_mask_np) and not np.any(grpo_mask_np):
+        raise ValueError("Hybrid branch tags are present but no samples are tagged as 'sgrpo' or 'grpo'")
+
+    advantages = torch.zeros_like(data.batch["token_level_rewards"])
+    returns = torch.zeros_like(data.batch["token_level_rewards"])
+
+    if np.any(sgrpo_mask_np):
+        sgrpo_data = data.select_idxs(sgrpo_mask_np)
+        sgrpo_data = compute_advantage(
+            sgrpo_data,
+            adv_estimator=AdvantageEstimator.SGRPO,
+            gamma=gamma,
+            lam=lam,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        sgrpo_mask = torch.from_numpy(sgrpo_mask_np).to(data.batch["token_level_rewards"].device)
+        advantages[sgrpo_mask] = sgrpo_data.batch["advantages"]
+        returns[sgrpo_mask] = sgrpo_data.batch["returns"]
+
+    if np.any(grpo_mask_np):
+        grpo_data = data.select_idxs(grpo_mask_np)
+        grpo_data = compute_advantage(
+            grpo_data,
+            adv_estimator=AdvantageEstimator.GRPO,
+            gamma=gamma,
+            lam=lam,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+        grpo_mask = torch.from_numpy(grpo_mask_np).to(data.batch["token_level_rewards"].device)
+        advantages[grpo_mask] = grpo_data.batch["advantages"]
+        returns[grpo_mask] = grpo_data.batch["returns"]
+
+    data.batch["advantages"] = advantages
+    data.batch["returns"] = returns
+    return data
+
+
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -409,6 +523,8 @@ class RayPPOTrainer:
                 max_response_length=int(self.config.data.max_response_length),
             )
 
+        self._hybrid_branch_cfg = OmegaConf.select(self.config, "algorithm.hybrid_branch")
+
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
@@ -500,6 +616,11 @@ class RayPPOTrainer:
             return False
         return self.global_steps >= int(self._sgrpo_controller.config.warmup_steps)
 
+    def _is_hybrid_branch_active(self, sgrpo_active: bool) -> bool:
+        if not sgrpo_active or self._sgrpo_controller is None:
+            return False
+        return self._hybrid_branch_cfg is not None and bool(self._hybrid_branch_cfg.get("enable", False))
+
     def _get_sgrpo_rollout_repeat_times(self, sgrpo_active: bool) -> int:
         if self._sgrpo_controller is not None and sgrpo_active:
             return 1
@@ -510,6 +631,123 @@ class RayPPOTrainer:
         if self._sgrpo_controller is not None and not sgrpo_active and adv_estimator == AdvantageEstimator.SGRPO:
             return AdvantageEstimator.GRPO
         return adv_estimator
+
+    def _build_hybrid_branch_rollouts(
+        self,
+        gen_batch: DataProto,
+        full_responses: DataProto,
+        generate_fn,
+    ) -> tuple[DataProto, Optional[torch.Tensor], dict[str, float], bool, Optional[np.ndarray]]:
+        """Route prompts by first-pass correctness and build mixed S-GRPO/GRPO rollout batch."""
+        if self._hybrid_branch_cfg is None:
+            return full_responses, None, {}, False, None
+
+        tag_key = str(self._hybrid_branch_cfg.get("tag_key", "branch_mode"))
+        threshold = float(self._hybrid_branch_cfg.get("correct_threshold", 0.5))
+        extra_rollouts = int(self._hybrid_branch_cfg.get("incorrect_extra_rollouts", 3))
+        extra_rollouts = max(0, extra_rollouts)
+
+        first_pass_reward_result = self._compute_or_extract_reward(
+            full_responses,
+            reward_fn=self.reward_fn,
+            sum_reward=True,
+        )
+        if isinstance(first_pass_reward_result, tuple):
+            first_pass_rewards = first_pass_reward_result[0]
+        else:
+            first_pass_rewards = first_pass_reward_result
+        first_pass_correct_mask = (first_pass_rewards >= threshold).detach().cpu().numpy().astype(bool)
+
+        correct_full, incorrect_full = _split_dataproto_by_mask(full_responses, first_pass_correct_mask)
+        correct_gen, incorrect_gen = _split_dataproto_by_mask(gen_batch, first_pass_correct_mask)
+
+        all_indices = np.arange(len(full_responses), dtype=np.int64)
+        correct_indices = all_indices[first_pass_correct_mask]
+        incorrect_indices = all_indices[~first_pass_correct_mask]
+
+        correct_serial = correct_full[:0]
+        correct_exit_orders = None
+        if len(correct_full) > 0:
+            correct_serial, correct_exit_orders = self._sgrpo_controller.create_serial_group_two_phase(
+                full_responses=correct_full,
+                generate_fn=generate_fn,
+            )
+            _attach_branch_tag(correct_serial, tag_key=tag_key, tag_value="sgrpo")
+
+        incorrect_mixed = incorrect_full[:0]
+        if len(incorrect_full) > 0:
+            chunks = [incorrect_full]
+            if extra_rollouts > 0:
+                incorrect_extra_gen = incorrect_gen.repeat(repeat_times=extra_rollouts, interleave=True)
+                if incorrect_extra_gen.meta_info is None:
+                    incorrect_extra_gen.meta_info = {}
+                incorrect_extra_gen.meta_info[DataProtoConfig.auto_padding_key] = True
+                incorrect_extra = generate_fn(incorrect_extra_gen)
+                chunks.append(incorrect_extra)
+            incorrect_mixed = _concat_dataprotos_non_empty(chunks)
+            _attach_branch_tag(incorrect_mixed, tag_key=tag_key, tag_value="grpo")
+
+        mixed_output = _concat_dataprotos_non_empty([correct_serial, incorrect_mixed])
+
+        correct_repeat_indices = np.repeat(correct_indices, self._sgrpo_controller.config.num_exits)
+        incorrect_once_indices = incorrect_indices
+        incorrect_extra_indices = np.repeat(incorrect_indices, extra_rollouts) if extra_rollouts > 0 else np.array([], dtype=np.int64)
+        mixed_source_indices = np.concatenate(
+            [correct_repeat_indices, incorrect_once_indices, incorrect_extra_indices],
+            axis=0,
+        )
+        if len(mixed_source_indices) != len(mixed_output):
+            raise RuntimeError(
+                "Hybrid source index count does not match mixed output size: "
+                f"{len(mixed_source_indices)} vs {len(mixed_output)}"
+            )
+
+        mixed_exit_orders: Optional[torch.Tensor] = None
+        if len(mixed_output) > 0:
+            device = mixed_output.batch["responses"].device
+            parts: list[torch.Tensor] = []
+            if len(correct_serial) > 0:
+                assert correct_exit_orders is not None
+                parts.append(correct_exit_orders.to(device))
+            if len(incorrect_mixed) > 0:
+                parts.append(torch.ones(len(incorrect_mixed), dtype=torch.long, device=device))
+            mixed_exit_orders = torch.cat(parts, dim=0) if len(parts) > 1 else parts[0]
+            if mixed_exit_orders.shape[0] != len(mixed_output):
+                raise RuntimeError(
+                    "Hybrid exit_order size does not match mixed output size: "
+                    f"{mixed_exit_orders.shape[0]} vs {len(mixed_output)}"
+                )
+
+        total_prompts = len(full_responses)
+        num_sgrpo_prompts = int(first_pass_correct_mask.sum())
+        num_grpo_prompts = int(total_prompts - num_sgrpo_prompts)
+        total_samples = max(len(mixed_output), 1)
+        num_sgrpo_samples = len(correct_serial)
+        num_grpo_samples = len(incorrect_mixed)
+
+        sgrpo_full_rollout_lengths = None
+        if len(correct_full) > 0 and "attention_mask" in correct_full.batch.keys() and "responses" in correct_full.batch.keys():
+            sgrpo_full_rollout_lengths = compute_response_mask(correct_full).sum(dim=-1).float()
+
+        hybrid_metrics = {
+            "hybrid_branch/first_pass_correct_frac": float(num_sgrpo_prompts / max(total_prompts, 1)),
+            "hybrid_branch/sgrpo_sample_frac": float(num_sgrpo_samples / total_samples),
+            "hybrid_branch/grpo_sample_frac": float(num_grpo_samples / total_samples),
+            "hybrid_branch/estimated_extra_generations": float(
+                num_sgrpo_prompts * max(self._sgrpo_controller.config.num_exits - 1, 0)
+                + num_grpo_prompts * extra_rollouts
+            ),
+        }
+
+        if sgrpo_full_rollout_lengths is not None and sgrpo_full_rollout_lengths.numel() > 0:
+            hybrid_metrics["hybrid_branch/sgrpo_full_rollout_length_mean"] = float(
+                sgrpo_full_rollout_lengths.mean().item()
+            )
+            hybrid_metrics["hybrid_branch/sgrpo_full_rollout_length_std"] = float(
+                sgrpo_full_rollout_lengths.std(unbiased=False).item()
+            )
+
+        return mixed_output, mixed_exit_orders, hybrid_metrics, True, mixed_source_indices
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -1436,9 +1674,11 @@ class RayPPOTrainer:
                     # pass global_steps to trace
                     gen_batch.meta_info["global_steps"] = self.global_steps
                     sgrpo_active = self._is_sgrpo_active()
+                    hybrid_branch_active = self._is_hybrid_branch_active(sgrpo_active)
                     current_adv_estimator = self._get_adv_estimator_for_step(sgrpo_active)
                     current_rollout_repeat_times = self._get_sgrpo_rollout_repeat_times(sgrpo_active)
                     metrics["sgrpo/active"] = float(sgrpo_active)
+                    metrics["hybrid_branch/active"] = float(hybrid_branch_active)
                     if self._sgrpo_controller is not None:
                         warmup_steps = int(self._sgrpo_controller.config.warmup_steps)
                         metrics["sgrpo/warmup_steps"] = warmup_steps
@@ -1453,6 +1693,7 @@ class RayPPOTrainer:
                         gen_batch_output = gen_batch
 
                     is_last_step = self.global_steps >= self.total_training_steps
+                    hybrid_source_indices = None
                     with marked_timer("step", timing_raw):
                         # generate a batch
                         with marked_timer("gen", timing_raw, color="red"):
@@ -1469,10 +1710,25 @@ class RayPPOTrainer:
                                     generate_fn = self.actor_rollout_wg.generate_sequences
                                 else:
                                     generate_fn = self.async_rollout_manager.generate_sequences
-                                gen_batch_output, exit_orders = self._sgrpo_controller.create_serial_group_two_phase(
-                                    full_responses=gen_batch_output,
-                                    generate_fn=generate_fn,
-                                )
+
+                                if hybrid_branch_active:
+                                    (
+                                        gen_batch_output,
+                                        exit_orders,
+                                        hybrid_metrics,
+                                        _,
+                                        hybrid_source_indices,
+                                    ) = self._build_hybrid_branch_rollouts(
+                                        gen_batch=gen_batch,
+                                        full_responses=gen_batch_output,
+                                        generate_fn=generate_fn,
+                                    )
+                                    metrics.update(hybrid_metrics)
+                                else:
+                                    gen_batch_output, exit_orders = self._sgrpo_controller.create_serial_group_two_phase(
+                                        full_responses=gen_batch_output,
+                                        generate_fn=generate_fn,
+                                    )
                             else:
                                 exit_orders = None
 
@@ -1513,7 +1769,12 @@ class RayPPOTrainer:
                                 del rm_scores, gen_baseline_batch, gen_baseline_output
                         if sgrpo_active:
                             batch.meta_info["rollout_repeat_times"] = 1
-                            batch = batch.repeat(repeat_times=self._sgrpo_controller.config.num_exits, interleave=True)
+                            if hybrid_branch_active:
+                                if hybrid_source_indices is None:
+                                    raise RuntimeError("Hybrid branch source indices were not returned.")
+                                batch = batch.select_idxs(hybrid_source_indices)
+                            else:
+                                batch = batch.repeat(repeat_times=self._sgrpo_controller.config.num_exits, interleave=True)
                         else:
                             batch.meta_info["rollout_repeat_times"] = current_rollout_repeat_times
                             batch = batch.repeat(repeat_times=current_rollout_repeat_times, interleave=True)
@@ -1637,11 +1898,25 @@ class RayPPOTrainer:
                                 metrics.update(aw_metrics)
 
                             if sgrpo_active and "exit_order" in batch.batch:
-                                sgrpo_metrics = self._sgrpo_controller.update_statistics(
-                                    rewards=batch.batch["token_level_rewards"],
-                                    exit_orders=batch.batch["exit_order"],
-                                )
-                                metrics.update(sgrpo_metrics)
+                                if hybrid_branch_active:
+                                    tag_key = str(self._hybrid_branch_cfg.get("tag_key", "branch_mode"))
+                                    if tag_key in batch.non_tensor_batch:
+                                        sgrpo_mask_np = np.asarray(batch.non_tensor_batch[tag_key] == "sgrpo")
+                                        if np.any(sgrpo_mask_np):
+                                            sgrpo_subset = batch.select_idxs(sgrpo_mask_np)
+                                            sgrpo_metrics = self._sgrpo_controller.update_statistics(
+                                                rewards=sgrpo_subset.batch["token_level_rewards"],
+                                                exit_orders=sgrpo_subset.batch["exit_order"],
+                                                response_mask=sgrpo_subset.batch["response_mask"],
+                                            )
+                                            metrics.update(sgrpo_metrics)
+                                else:
+                                    sgrpo_metrics = self._sgrpo_controller.update_statistics(
+                                        rewards=batch.batch["token_level_rewards"],
+                                        exit_orders=batch.batch["exit_order"],
+                                        response_mask=batch.batch["response_mask"],
+                                    )
+                                    metrics.update(sgrpo_metrics)
 
                             # Compute rollout correction: IS weights, rejection sampling, and metrics
                             # Only runs in decoupled mode (computes once per batch using stable π_old)
@@ -1663,15 +1938,26 @@ class RayPPOTrainer:
                                 "norm_adv_by_std_in_grpo", True
                             )  # GRPO adv normalization factor
 
-                            batch = compute_advantage(
-                                batch,
-                                adv_estimator=current_adv_estimator,
-                                gamma=self.config.algorithm.gamma,
-                                lam=self.config.algorithm.lam,
-                                num_repeat=current_rollout_repeat_times,
-                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                                config=self.config.algorithm,
-                            )
+                            if hybrid_branch_active:
+                                tag_key = str(self._hybrid_branch_cfg.get("tag_key", "branch_mode"))
+                                batch = compute_hybrid_branch_advantages(
+                                    batch,
+                                    tag_key=tag_key,
+                                    gamma=self.config.algorithm.gamma,
+                                    lam=self.config.algorithm.lam,
+                                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                    config=self.config.algorithm,
+                                )
+                            else:
+                                batch = compute_advantage(
+                                    batch,
+                                    adv_estimator=current_adv_estimator,
+                                    gamma=self.config.algorithm.gamma,
+                                    lam=self.config.algorithm.lam,
+                                    num_repeat=current_rollout_repeat_times,
+                                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                    config=self.config.algorithm,
+                                )
 
                         # update critic
                         if self.use_critic:
@@ -1750,7 +2036,7 @@ class RayPPOTrainer:
                         }
                     )
                     # collect metrics
-                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic, tokenizer=self.tokenizer))
                     metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                     # TODO: implement actual tflpo and theoretical tflpo
                     n_gpus = self.resource_pool_manager.get_n_gpus()

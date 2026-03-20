@@ -993,12 +993,21 @@ class AgentLoopManager:
             self.reward_model_manager.wake_up()
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
-        outputs = ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
+        active_dispatch = [
+            (worker, chunk)
+            for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+            if len(chunk) > 0
+        ]
+
+        if not active_dispatch:
+            output = prompts[:0]
+            output.meta_info = {"timing": {}}
+            self.sleep()
+            if self.reward_model_manager:
+                self.reward_model_manager.sleep()
+            return output
+
+        outputs = ray.get([worker.generate_sequences.remote(chunk) for worker, chunk in active_dispatch])
         output = DataProto.concat(outputs)
         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
         self.sleep()

@@ -1,8 +1,11 @@
 #!/bin/bash
-# SLURM job for TinyZero S-GRPO training with warmup and phased generation window
-# Warmup runs GRPO-style rollouts with max_tokens=1024, then enables S-GRPO with max_tokens=2048
+# SLURM job for TinyZero Hybrid S-GRPO training
+# Phase behavior:
+# - First pass: one full rollout per prompt
+# - Correct prompts: S-GRPO serial exits
+# - Incorrect prompts: GRPO-style extra full rollouts
 
-#SBATCH --job-name=tinyzero_sgrpo_warmup
+#SBATCH --job-name=tinyzero_hybrid_sgrpo
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
@@ -33,7 +36,7 @@ export DATA_DIR=${DATA_DIR:-$PWD}
 export BASE_MODEL=${BASE_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
 export N_GPUS=${N_GPUS:-4}
 export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
-export EXPERIMENT_NAME=${EXPERIMENT_NAME:-sgrpo_warmup50}
+export EXPERIMENT_NAME=${EXPERIMENT_NAME:-hybrid_sgrpo_warmup50}
 export CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-/scratch-shared/$USER/TinyZero/checkpoints}
 export CHECKPOINT_DIR=${CHECKPOINT_DIR:-$CHECKPOINT_ROOT/$EXPERIMENT_NAME}
 
@@ -66,6 +69,10 @@ python3 -m verl.trainer.main_ppo \
 	algorithm.sgrpo.num_exits=4 \
 	algorithm.sgrpo.decay_factor=2.0 \
 	algorithm.sgrpo.exit_method=uniform \
+	algorithm.hybrid_branch.enable=True \
+	algorithm.hybrid_branch.correct_threshold=0.5 \
+	algorithm.hybrid_branch.incorrect_extra_rollouts=3 \
+	algorithm.hybrid_branch.tag_key=branch_mode \
 	algorithm.use_kl_in_reward=False \
 	agent.adaptive_window.enable=True \
 	agent.adaptive_window.mode=phased \
@@ -75,12 +82,12 @@ python3 -m verl.trainer.main_ppo \
 	trainer.n_gpus_per_node=$N_GPUS \
 	trainer.nnodes=1 \
 	trainer.resume_mode=auto \
-	trainer.total_training_steps=75 \
-	trainer.save_freq=75 \
+	trainer.total_training_steps=100 \
+	trainer.save_freq=100 \
 	trainer.test_freq=25 \
 	trainer.val_before_train=False \
 	trainer.logger=['console','wandb'] \
 	trainer.project_name=TinyZero \
 	trainer.experiment_name=$EXPERIMENT_NAME \
 	trainer.default_local_dir=$CHECKPOINT_DIR \
-	2>&1 | tee verl_sgrpo_warmup.log
+	2>&1 | tee verl_hybrid_sgrpo.log

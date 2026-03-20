@@ -164,6 +164,21 @@ algorithm:
     # Prompt appended to truncated reasoning before continuation generation
     answer_inducer: "Time is limited, stop thinking and start answering.\n</think>\n<answer>"
 
+  # Hybrid branching between S-GRPO (correct first pass) and GRPO (incorrect first pass)
+  hybrid_branch:
+
+    # Enable hybrid branch routing during active S-GRPO phase
+    enable: False
+
+    # First-pass sequence reward threshold for S-GRPO routing
+    correct_threshold: 0.5
+
+    # Additional full rollouts for incorrect prompts (first pass + this value total)
+    incorrect_extra_rollouts: 3
+
+    # non_tensor_batch key used to mark per-sample branch identity
+    tag_key: branch_mode
+
 # adaptive window and analysis utilities
 agent:
 
