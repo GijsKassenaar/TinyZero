@@ -17,6 +17,7 @@ Metrics related to the PPO trainer.
 
 from collections import defaultdict
 from functools import partial
+import re
 from typing import Any, Callable
 
 import numpy as np
@@ -26,6 +27,41 @@ import os
 
 from verl import DataProto
 from verl.utils.import_utils import deprecated
+
+
+_THINKING_TAG_PATTERN = re.compile(r"<(?:think|thinking)>(.*?)</(?:think|thinking)>", re.IGNORECASE | re.DOTALL)
+
+
+def _tokenize_text_length(text: str, tokenizer: Any) -> int:
+    """Return token length for text without adding special tokens."""
+    if hasattr(tokenizer, "encode"):
+        return len(tokenizer.encode(text, add_special_tokens=False))
+    tokenized = tokenizer(text, add_special_tokens=False, return_attention_mask=False)
+    return len(tokenized["input_ids"])
+
+
+def _compute_reasoning_token_lengths(batch: DataProto, response_length: torch.Tensor, tokenizer: Any) -> torch.Tensor:
+    """Compute per-sample token counts inside <think>/<thinking> blocks."""
+    responses = batch.batch["responses"]
+    lengths = []
+
+    for i in range(responses.size(0)):
+        valid_len = int(response_length[i].item())
+        if valid_len <= 0:
+            lengths.append(0.0)
+            continue
+
+        response_ids = responses[i, :valid_len].tolist()
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+
+        reasoning_tokens = 0
+        for match in _THINKING_TAG_PATTERN.finditer(response_text):
+            inner_text = match.group(1)
+            if inner_text:
+                reasoning_tokens += _tokenize_text_length(inner_text, tokenizer)
+        lengths.append(float(reasoning_tokens))
+
+    return torch.tensor(lengths, dtype=torch.float32, device=response_length.device)
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -79,7 +115,7 @@ def _compute_response_info(batch: DataProto) -> dict[str, Any]:
     )
 
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+def compute_data_metrics(batch: DataProto, use_critic: bool = True, tokenizer: Any | None = None) -> dict[str, Any]:
     """
     Computes various metrics from a batch of data for PPO training.
 
@@ -101,7 +137,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - critic/vf_explained_var: Explained variance of the value function (if use_critic=True)
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
-            - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
+                        - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
+                        - response_length/mean_reasoning: Mean token length inside thinking tags
+                        - response_length/incorrect_non_aborted_mean: Mean response length for incorrect,
+                            non-aborted samples
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
@@ -158,6 +197,28 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     else:
         raise ValueError("All samples are aborted, this should not happen.")
 
+    # Incorrect samples excluding aborted responses.
+    incorrect_mask = sequence_score < 0.5
+    incorrect_non_aborted_mask = incorrect_mask & non_aborted_mask
+    incorrect_non_aborted_response_length = response_length[incorrect_non_aborted_mask]
+    if incorrect_non_aborted_response_length.numel() > 0:
+        incorrect_non_aborted_response_length_mean = (
+            torch.mean(incorrect_non_aborted_response_length).detach().item()
+        )
+    else:
+        incorrect_non_aborted_response_length_mean = 0.0
+
+    # Mean token length inside <think>/<thinking> blocks, excluding aborted samples.
+    if tokenizer is not None:
+        reasoning_token_lengths = _compute_reasoning_token_lengths(batch, response_length, tokenizer)
+        non_aborted_reasoning_lengths = reasoning_token_lengths[non_aborted_mask]
+        if non_aborted_reasoning_lengths.numel() > 0:
+            mean_reasoning_length = torch.mean(non_aborted_reasoning_lengths).detach().item()
+        else:
+            mean_reasoning_length = 0.0
+    else:
+        mean_reasoning_length = 0.0
+
     metrics = {
         # score
         "critic/score/mean": score_mean,
@@ -200,6 +261,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "response_length_non_aborted/max": non_aborted_response_length_max,
         "response_length_non_aborted/min": non_aborted_response_length_min,
         "response_length_non_aborted/clip_ratio": non_aborted_response_length_clip_ratio,
+        "response_length/mean_reasoning": mean_reasoning_length,
+        "response_length/incorrect_non_aborted_mean": incorrect_non_aborted_response_length_mean,
         # aborted ratio
         # Fraction of samples whose response length is zero
         "response/aborted_ratio": aborted_ratio,
