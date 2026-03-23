@@ -67,7 +67,7 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0.0,
     """
     target = ground_truth['target']
     numbers = ground_truth['numbers']
-    
+
     equation = extract_solution(solution_str=solution_str)
     do_print = random.randint(1, 64) == 1
     
@@ -76,6 +76,12 @@ def compute_score(solution_str, ground_truth, method='strict', format_score=0.0,
         print(f"Target: {target} | Numbers: {numbers}")
         print(f"Extracted equation: {equation}")
         print(f"Solution string: {solution_str}")
+
+    # Enforce explicit closure of reasoning span.
+    if re.search(r'</(?:think|thinking)>', solution_str, flags=re.IGNORECASE) is None:
+        if do_print:
+            print("Did not finish thinking")
+        return 0
 
     if equation is None:
         if do_print:

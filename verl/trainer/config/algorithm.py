@@ -19,6 +19,7 @@ from verl.base_config import BaseConfig
 
 __all__ = [
     "AlgoConfig",
+    "DiscountedReasoningConfig",
     "FilterGroupsConfig",
     "HybridBranchConfig",
     "KLControlConfig",
@@ -86,6 +87,19 @@ class LeadConfig(BaseConfig):
     beta: float = 0.2
     epsilon: float = 1e-6
     correctness_threshold: float = 0.5
+
+
+@dataclass
+class DiscountedReasoningConfig(BaseConfig):
+    """Configuration for exponential discounting over reasoning tokens.
+
+    Args:
+        enable (bool): Whether to enable reasoning-only discounted reward.
+        gamma (float): Exponential decay base in gamma^K, where K is reasoning-token count.
+    """
+
+    enable: bool = False
+    gamma: float = 0.999
 
 
 @dataclass
@@ -538,6 +552,7 @@ class AlgoConfig(BaseConfig):
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
+        discounted_reasoning (Optional[DiscountedReasoningConfig]): Exponential discount over reasoning tokens.
         sgrpo (Optional[SGRPOConfig]): S-GRPO two-phase serial-group generation settings.
         hybrid_branch (Optional[HybridBranchConfig]): Hybrid branch routing settings for active S-GRPO.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
@@ -567,6 +582,7 @@ class AlgoConfig(BaseConfig):
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
     lead: Optional[LeadConfig] = None
+    discounted_reasoning: Optional[DiscountedReasoningConfig] = None
     sgrpo: Optional[SGRPOConfig] = None
     hybrid_branch: Optional[HybridBranchConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)

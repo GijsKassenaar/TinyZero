@@ -44,6 +44,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.adaptive_window import AdaptiveSuccessWindowConfig, AdaptiveSuccessWindowController
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.ppo.discounted_reasoning import apply_reasoning_reward_discount
 from verl.trainer.ppo.metric_utils import (
     compute_completion_metrics,
     compute_data_metrics,
@@ -145,7 +146,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
             - A dictionary of metrics related to the KL penalty
     """
     response_mask = data.batch["response_mask"]
-    token_level_scores = data.batch["token_level_scores"]
+    token_level_scores = data.batch.get("token_level_scores_for_reward", data.batch["token_level_scores"])
     batch_size = data.batch.batch_size[0]
 
     # compute kl between ref_policy and current policy
@@ -1805,6 +1806,8 @@ class RayPPOTrainer:
                                 batch = batch.union(reward_tensor)
 
                             # Compute or extract reward for training
+                            discounted_reward_tensor = None
+
                             if self.config.reward_model.launch_reward_fn_async:
                                 future_reward = compute_reward_async.remote(
                                     data=batch, config=self.config, tokenizer=self.tokenizer
@@ -1813,6 +1816,19 @@ class RayPPOTrainer:
                                 reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
                                     batch, reward_fn=self.reward_fn, return_dict=False
                                 )
+
+                                discounted_reasoning_cfg = self.config.algorithm.get("discounted_reasoning", None)
+                                if (
+                                    discounted_reasoning_cfg is not None
+                                    and discounted_reasoning_cfg.get("enable", False)
+                                ):
+                                    discounted_reward_tensor, discounted_reasoning_metrics = apply_reasoning_reward_discount(
+                                        batch=batch,
+                                        reward_tensor=reward_tensor,
+                                        tokenizer=self.tokenizer,
+                                        discount_cfg=discounted_reasoning_cfg,
+                                    )
+                                    metrics.update(discounted_reasoning_metrics)
 
                         # Operating Mode Selection:
                         # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1876,7 +1892,23 @@ class RayPPOTrainer:
                             reward_extra_infos_dict: dict[str, list]
                             if self.config.reward_model.launch_reward_fn_async:
                                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                                discounted_reasoning_cfg = self.config.algorithm.get("discounted_reasoning", None)
+                                if (
+                                    discounted_reasoning_cfg is not None
+                                    and discounted_reasoning_cfg.get("enable", False)
+                                ):
+                                    discounted_reward_tensor, discounted_reasoning_metrics = apply_reasoning_reward_discount(
+                                        batch=batch,
+                                        reward_tensor=reward_tensor,
+                                        tokenizer=self.tokenizer,
+                                        discount_cfg=discounted_reasoning_cfg,
+                                    )
+                                    metrics.update(discounted_reasoning_metrics)
                             batch.batch["token_level_scores"] = reward_tensor
+                            if discounted_reward_tensor is not None:
+                                batch.batch["token_level_scores_for_reward"] = discounted_reward_tensor
+                            elif "token_level_scores_for_reward" in batch.batch:
+                                batch.batch.pop("token_level_scores_for_reward")
 
                             if reward_extra_infos_dict:
                                 batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -1888,7 +1920,9 @@ class RayPPOTrainer:
                                 )
                                 metrics.update(kl_metrics)
                             else:
-                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                                batch.batch["token_level_rewards"] = batch.batch.get(
+                                    "token_level_scores_for_reward", batch.batch["token_level_scores"]
+                                )
 
                             if self._adaptive_window is not None:
                                 aw_metrics = self._adaptive_window.update_from_batch(

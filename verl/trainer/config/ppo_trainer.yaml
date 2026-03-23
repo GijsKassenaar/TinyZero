@@ -143,6 +143,15 @@ algorithm:
     # Fallback threshold to infer correctness from sequence score
     correctness_threshold: 0.5
 
+  # Exponential reward discounting over reasoning tokens inside think tags
+  discounted_reasoning:
+
+    # Enable reasoning-only reward discounting: R = gamma^K * reward
+    enable: False
+
+    # Exponential decay base (0 < gamma <= 1)
+    gamma: 0.999
+
   # Serial-Group Decaying-Reward Policy Optimization configuration
   sgrpo:
 

@@ -29,7 +29,7 @@ from verl import DataProto
 from verl.utils.import_utils import deprecated
 
 
-_THINKING_TAG_PATTERN = re.compile(r"<(?:think|thinking)>(.*?)</(?:think|thinking)>", re.IGNORECASE | re.DOTALL)
+_THINKING_CLOSE_TAG_PATTERN = re.compile(r"</(?:think|thinking)>", re.IGNORECASE)
 
 
 def _tokenize_text_length(text: str, tokenizer: Any) -> int:
@@ -40,28 +40,52 @@ def _tokenize_text_length(text: str, tokenizer: Any) -> int:
     return len(tokenized["input_ids"])
 
 
-def _compute_reasoning_token_lengths(batch: DataProto, response_length: torch.Tensor, tokenizer: Any) -> torch.Tensor:
-    """Compute per-sample token counts inside <think>/<thinking> blocks."""
+def _extract_reasoning_spans(response_text: str) -> tuple[list[str], bool]:
+    """Extract reasoning text for prompt-prefilled <think> format.
+
+    The opening think tag is expected in the prompt prefix, so response text starts
+    inside think and ends reasoning at the first closing think tag.
+    """
+    close_match = _THINKING_CLOSE_TAG_PATTERN.search(response_text)
+    if close_match is not None:
+        prefix = response_text[: close_match.start()]
+        if prefix.strip():
+            return [prefix], True
+
+        return [], True
+
+    return [], False
+
+
+def _compute_reasoning_token_lengths(
+    batch: DataProto, response_length: torch.Tensor, tokenizer: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-sample reasoning token counts and whether a closing think tag was found."""
     responses = batch.batch["responses"]
     lengths = []
+    closed_think = []
 
     for i in range(responses.size(0)):
         valid_len = int(response_length[i].item())
         if valid_len <= 0:
             lengths.append(0.0)
+            closed_think.append(False)
             continue
 
         response_ids = responses[i, :valid_len].tolist()
         response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
 
+        spans, has_close_tag = _extract_reasoning_spans(response_text)
         reasoning_tokens = 0
-        for match in _THINKING_TAG_PATTERN.finditer(response_text):
-            inner_text = match.group(1)
-            if inner_text:
-                reasoning_tokens += _tokenize_text_length(inner_text, tokenizer)
+        for span in spans:
+            reasoning_tokens += _tokenize_text_length(span, tokenizer)
         lengths.append(float(reasoning_tokens))
+        closed_think.append(bool(has_close_tag))
 
-    return torch.tensor(lengths, dtype=torch.float32, device=response_length.device)
+    return (
+        torch.tensor(lengths, dtype=torch.float32, device=response_length.device),
+        torch.tensor(closed_think, dtype=torch.bool, device=response_length.device),
+    )
 
 
 @deprecated("verl.utils.metric.reduce_metrics")
@@ -210,10 +234,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, tokenizer: A
 
     # Mean token length inside <think>/<thinking> blocks, excluding aborted samples.
     if tokenizer is not None:
-        reasoning_token_lengths = _compute_reasoning_token_lengths(batch, response_length, tokenizer)
-        non_aborted_reasoning_lengths = reasoning_token_lengths[non_aborted_mask]
-        if non_aborted_reasoning_lengths.numel() > 0:
-            mean_reasoning_length = torch.mean(non_aborted_reasoning_lengths).detach().item()
+        reasoning_token_lengths, reasoning_closed_mask = _compute_reasoning_token_lengths(batch, response_length, tokenizer)
+        reasoning_valid_mask = non_aborted_mask & reasoning_closed_mask
+        valid_reasoning_lengths = reasoning_token_lengths[reasoning_valid_mask]
+        if valid_reasoning_lengths.numel() > 0:
+            mean_reasoning_length = torch.mean(valid_reasoning_lengths).detach().item()
         else:
             mean_reasoning_length = 0.0
     else:
