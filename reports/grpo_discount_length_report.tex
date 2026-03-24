@@ -1,0 +1,230 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{setspace}
+\setstretch{1.1}
+
+\title{Discount Factors and Length Penalties in GRPO Variants}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section{GRPO-lambda (arXiv:2510.00194)}
+
+GRPO-lambda introduces token-level temporal credit assignment into critic-free GRPO. The main difference from vanilla GRPO is that the sequence-level group-normalized signal is no longer applied uniformly to every valid token. Instead, credit is traced backward over token positions with a decaying factor. In the formulation used in this report, for a sample with valid response length $T$, token index $t \in \{0,\dots,T-1\}$, and normalized group outcome $\hat r_i$, the token advantage is
+\begin{equation}
+A_{i,t} = \hat r_i \cdot \lambda^{T-1-t}.
+\end{equation}
+This implies that later tokens receive larger magnitude updates because their exponent is smaller, while earlier tokens receive smaller magnitude updates because their exponent is larger. The sign is inherited from $\hat r_i$, so the trace reshapes magnitude over position rather than flipping direction. In this sense, GRPO-lambda remains outcome-supervised but becomes position-sensitive.
+
+Compared to this, vanilla GRPO in outcome form can be viewed as
+\begin{equation}
+A^{\mathrm{GRPO}}_{i,t} = \hat r_i \cdot \mathbf{1}_{t<T},
+\end{equation}
+which means all valid tokens receive the same scalar advantage. GRPO-lambda therefore changes the distribution of credit over tokens without necessarily changing the sequence-level score itself.
+
+This section is based on \cite{grpo-lambda}.
+
+\section{GRPO-LEAD (arXiv:2504.09696)}
+
+GRPO-LEAD modifies score shaping before group normalization using length-aware reward design, explicit penalties for incorrect outputs, and (in its full version) difficulty-aware weighting. The core length-normalization quantity is the standardized length
+In this report's LEAD calculations, $\mu_{\mathrm{len}}$ and $\sigma_{\mathrm{len}}$ are computed using only correct responses in the group.
+\begin{equation}
+z_i = \frac{|o_i|-\mu_{\mathrm{len}}}{\sigma_{\mathrm{len}}+\epsilon},
+\end{equation}
+and the shaped reward is
+\begin{equation}
+R_i =
+\begin{cases}
+\exp(-\alpha z_i), & \text{if correct},\\
+\text{incorrect\_penalty}, & \text{if incorrect}.
+\end{cases}
+\end{equation}
+In the complete LEAD setup, a group-level correctness ratio $\rho_q$ is used to compute a multiplicative weight
+\begin{equation}
+w = \exp\!\left(-\frac{(\rho_q-\tau)^2}{2\beta^2}\right),
+\end{equation}
+which scales normalized advantages. In the calculations below, where noted, this difficulty reweighting is intentionally omitted to isolate pure length effects.
+
+This section is based on \cite{grpo-LEAD}.
+
+\section{Discounted Reasoning GRPO (arXiv:2510.23486)}
+
+Discounted reasoning applies an explicit token-cost style discount to reward magnitude. The objective-relevant trajectory reward is
+\begin{equation}
+R(\tau) = \gamma^{K(\tau)} r_e(\tau) + r_f(\tau),
+\end{equation}
+where $K(\tau)$ is reasoning-token count, $r_e(\tau)$ is environment correctness reward, and $r_f(\tau)$ is formatting or shaping reward. This mechanism directly scales reward down as reasoning length increases, in contrast to lambda tracing which primarily reshapes token-level credit assignment.
+
+This section is based on \cite{naive-discount}.
+
+\section{Worked Example 1: One GRPO Group, Size 4, All Correct, Lengths 600 to 800}
+
+Setup:
+
+\begin{itemize}
+\item Lengths $K=[620,680,740,790]$
+\item Correctness $c=[1,1,1,1]$
+\item $\lambda=0.99$, $\gamma=0.999$
+\end{itemize}
+
+\subsection*{A) Vanilla GRPO baseline}
+
+If rewards are identical ($r_i=1$), group normalization gives
+\begin{equation}
+A_i = \frac{r_i-\mu}{\sigma+\epsilon} = 0,
+\end{equation}
+so sequence advantages are all zero.
+
+\subsection*{B) LEAD (no difficulty reweighting)}
+
+Using $\alpha=0.1$:
+
+\begin{itemize}
+\item Standardized lengths: $[-1.3718,-0.4311,0.5095,1.2934]$
+\item LEAD rewards: $[1.1470,1.0441,0.9503,0.8787]$
+\item Normalized advantages: $[1.2200,0.3353,-0.4699,-1.0855]$
+\end{itemize}
+
+\subsection*{C) Gamma-discounted reasoning}
+
+Using $r_i=\gamma^{K_i}$:
+
+\begin{itemize}
+\item Rewards: $[0.53778,0.50645,0.47694,0.45366]$
+\item Normalized advantages: $[1.2086,0.3493,-0.4599,-1.0981]$
+\end{itemize}
+
+Interpretation: shorter correct traces receive larger positive sequence advantage.
+
+\subsection*{D) GRPO-lambda token tracing from vanilla GRPO only (short version)}
+
+Start from vanilla GRPO sequence advantages (section A): all are zero.
+
+\begin{equation}
+A_i^{\mathrm{seq}}=0 \quad\Rightarrow\quad A_{i,t}^{\lambda}=A_i^{\mathrm{seq}}\cdot 0.99^{T_i-1-t}=0
+\end{equation}
+
+So for this all-correct/equal-reward group, lambda cannot create signal; it only redistributes existing signal.
+
+\section{Worked Example 2: Same Lengths, Two Correct and Two Incorrect}
+
+Setup:
+
+\begin{itemize}
+\item Lengths $K=[620,680,740,790]$
+\item Correctness $c=[1,1,0,0]$
+\item $\lambda=0.99$, $\gamma=0.999$
+\end{itemize}
+
+\subsection*{A) LEAD (no difficulty reweighting, correct-only length z-score)}
+
+Using $\alpha=0.1$, incorrect penalty $=-1.0$:
+
+\begin{itemize}
+\item LEAD rewards: $[1.1052,0.9048,-1.0,-1.0]$
+\item Normalized advantages: $[0.9502,0.7776,-0.8639,-0.8639]$
+\end{itemize}
+
+\subsection*{B) Gamma-discounted reasoning}
+
+Using $r_i=\gamma^{K_i}\cdot c_i$:
+
+\begin{itemize}
+\item Rewards: $[0.53778,0.50645,0,0]$
+\item Normalized advantages: $[0.9172,0.8133,-0.8652,-0.8652]$
+\end{itemize}
+
+\subsection*{C) GRPO-lambda (vanilla GRPO + lambda)}
+
+Vanilla GRPO sequence rewards are binary: $[1,1,0,0]$.
+
+\begin{itemize}
+\item Vanilla normalized sequence advantages: $[0.8660,0.8660,-0.8660,-0.8660]$
+\end{itemize}
+
+Apply token trace:
+
+\begin{equation}
+A_{i,t}^{\lambda}=A_i^{\mathrm{seq}}\cdot 0.99^{T_i-1-t}
+\end{equation}
+
+First/mid/last token values:
+
+\begin{itemize}
+\item Sample 1 ($T=620$): $[0.001721,0.038410,0.8660]$
+\item Sample 2 ($T=680$): $[0.000942,0.028412,0.8660]$
+\item Sample 3 ($T=740$): $[-0.000515,-0.021016,-0.8660]$
+\item Sample 4 ($T=790$): $[-0.000312,-0.016347,-0.8660]$
+\end{itemize}
+
+\section{Worked Example 3: Longer Rollouts Around 2000 Tokens, Higher Variance, Two Correct and Two Incorrect}
+
+Setup:
+
+\begin{itemize}
+\item Lengths $K=[1600,1900,2200,2500]$
+\item Correctness $c=[1,0,1,0]$
+\item $\lambda=0.99$, $\gamma=0.999$
+\end{itemize}
+
+\subsection*{A) LEAD (no difficulty reweighting, correct-only length z-score)}
+
+Using $\alpha=0.1$, incorrect penalty $=-1.0$:
+
+\begin{itemize}
+\item LEAD rewards: $[1.1052,-1.0,0.9048,-1.0]$
+\item Normalized advantages: $[0.9502,-0.8639,0.7776,-0.8639]$
+\end{itemize}
+
+\subsection*{B) Gamma-discounted reasoning}
+
+Using $r_i=\gamma^{K_i}\cdot c_i$:
+
+\begin{itemize}
+\item Rewards: $[0.20174,0,0.11068,0]$
+\item Normalized advantages: $[1.2674,-0.8007,0.3340,-0.8007]$
+\end{itemize}
+
+\subsection*{C) GRPO-lambda (vanilla GRPO + lambda)}
+
+Vanilla GRPO sequence rewards are binary: $[1,0,1,0]$.
+
+\begin{itemize}
+\item Vanilla normalized sequence advantages: $[0.8660,-0.8660,0.8660,-0.8660]$
+\end{itemize}
+
+Apply token trace:
+
+\begin{equation}
+A_{i,t}^{\lambda}=A_i^{\mathrm{seq}}\cdot 0.99^{T_i-1-t}
+\end{equation}
+
+First/mid/last token values:
+
+\begin{itemize}
+\item Sample 1 ($T=1600$): $[9.08\times10^{-8},2.79\times10^{-4},0.8660]$
+\item Sample 2 ($T=1900$): $[-4.45\times10^{-9},-6.18\times10^{-5},-0.8660]$
+\item Sample 3 ($T=2200$): $[2.18\times10^{-10},1.37\times10^{-5},0.8660]$
+\item Sample 4 ($T=2500$): $[-1.07\times10^{-11},-3.03\times10^{-6},-0.8660]$
+\end{itemize}
+
+This shows that for long trajectories and $\lambda<1$, early-token credit becomes extremely small while end-of-trajectory credit remains large.
+
+\section{Practical Takeaway in This Codebase}
+
+In practical terms, LEAD and discounted reasoning primarily modify sequence-level reward shaping before GRPO normalization, while GRPO-lambda modifies token-level credit assignment after group normalization through backward traces. Combining discounted reasoning with GRPO-lambda is therefore coherent: discounting changes per-sequence outcome magnitudes, and lambda then redistributes token-level credit inside each sequence.
+
+\section{Qualitative Comparison of the Three Algorithms}
+
+GRPO-lambda is best viewed as implicit discounting of credit rather than reward, because it attenuates token-level credit by position while leaving sequence reward definition unchanged. GRPO-LEAD is a relative length mechanism because penalties and bonuses are defined with respect to group-level length statistics, so the notion of being too long is prompt-relative. Gamma-discounted reasoning is a direct and global mechanism because reward magnitude itself is multiplied by $\gamma^{K}$, making every additional reasoning token carry an explicit multiplicative cost. Put differently, lambda changes where credit goes, LEAD changes how samples are ranked relative to peers, and gamma discount changes the reward scale as length increases.
+
+\bibliographystyle{unsrt}
+\bibliography{grpo_discount_length_report}
+
+\end{document}

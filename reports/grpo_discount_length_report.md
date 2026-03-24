@@ -74,6 +74,8 @@ GRPO-LEAD changes group outcome shaping before normalization using three ideas:
 
 Length-standardized score within a group:
 
+In this report's LEAD calculations, $\mu_{len}$ and $\sigma_{len}$ are computed using only correct responses in the group.
+
 $$
 z_i = \frac{|o_i|-\mu_{len}}{\sigma_{len}+\epsilon}
 $$
@@ -204,70 +206,114 @@ Interpretation: even with all-correct outcomes, LEAD creates ranking pressure to
 Sequence rewards become:
 
 $$
-r_i = \gamma^{K_i},\quad \gamma=0.9999
+r_i = \gamma^{K_i},\quad \gamma=0.999
 $$
 
 Numerically:
 
-- rewards $\approx [0.93988, 0.93426, 0.92867, 0.92404]$
+- rewards $\approx [0.53778, 0.50645, 0.47694, 0.45366]$
 - normalized group advantages:
-  - $[1.1899, 0.3709, -0.4431, -1.1177]$
+    - $[1.2086, 0.3493, -0.4599, -1.0981]$
 
 Interpretation: shorter correct traces receive larger positive sequence advantage.
 
-### D) GRPO-lambda token tracing from vanilla GRPO only (full calculation for all 4 examples)
+### D) GRPO-lambda token tracing from vanilla GRPO only (short version)
 
-Start from vanilla GRPO sequence advantages (section A). In this all-correct group with identical reward $r_i=1$:
-
-$$
-A_i^{seq} = \frac{r_i-\mu}{\sigma+\epsilon} = 0 \quad \forall i \in \{1,2,3,4\}
-$$
-
-Then apply lambda-only trace with $\lambda=0.99$:
+Start from vanilla GRPO sequence advantages (section A): all are zero.
 
 $$
-A_{i,t}^{\lambda} = A_i^{seq} \cdot 0.99^{T_i-1-t}
+A_i^{seq}=0 \quad\Rightarrow\quad A_{i,t}^{\lambda}=A_i^{seq}\cdot 0.99^{T_i-1-t}=0
 $$
 
-Because each $A_i^{seq}=0$, every token advantage remains 0.
+So for this all-correct/equal-reward group, lambda cannot create signal; it only redistributes existing signal.
 
-1. Example 1: $T_1=620$, $A_1^{seq}=0$
+---
+
+## Worked Example 2: Same lengths, but 2 correct and 2 incorrect
+
+Setup:
+
+- Lengths $K=[620,680,740,790]$
+- Correctness $c=[1,1,0,0]$
+- $\lambda=0.99$, $\gamma=0.999$
+
+### A) LEAD (no difficulty reweighting, correct-only length z-score)
+
+Using $\alpha=0.1$, incorrect penalty $=-1.0$:
+
+- LEAD rewards: $[1.1052,\ 0.9048,\ -1.0,\ -1.0]$
+- Normalized advantages: $[0.9502,\ 0.7776,\ -0.8639,\ -0.8639]$
+
+### B) Gamma-discounted reasoning
+
+Using $r_i=\gamma^{K_i}\cdot c_i$:
+
+- Rewards: $[0.53778,\ 0.50645,\ 0,\ 0]$
+- Normalized advantages: $[0.9172,\ 0.8133,\ -0.8652,\ -0.8652]$
+
+### C) GRPO-lambda (vanilla GRPO + lambda)
+
+Vanilla GRPO sequence rewards are binary: $[1,1,0,0]$.
+
+- Vanilla normalized sequence advantages: $[0.8660,\ 0.8660,\ -0.8660,\ -0.8660]$
+
+Apply token trace
+
 $$
-\begin{aligned}
-A_{1,\text{first}} &= 0\cdot 0.99^{619}=0,\\
-A_{1,\text{mid}}   &= 0\cdot 0.99^{310}=0,\\
-A_{1,\text{last}}  &= 0\cdot 0.99^{0}=0.
-\end{aligned}
+A_{i,t}^{\lambda}=A_i^{seq}\cdot 0.99^{T_i-1-t}
 $$
 
-2. Example 2: $T_2=680$, $A_2^{seq}=0$
+First/mid/last token values:
+
+- Sample 1 ($T=620$): $[0.001721,\ 0.038410,\ 0.8660]$
+- Sample 2 ($T=680$): $[0.000942,\ 0.028412,\ 0.8660]$
+- Sample 3 ($T=740$): $[-0.000515,\ -0.021016,\ -0.8660]$
+- Sample 4 ($T=790$): $[-0.000312,\ -0.016347,\ -0.8660]$
+
+---
+
+## Worked Example 3: Longer rollouts (~2000) with higher length variance, 2 correct and 2 incorrect
+
+Setup:
+
+- Lengths $K=[1600,1900,2200,2500]$
+- Correctness $c=[1,0,1,0]$
+- $\lambda=0.99$, $\gamma=0.999$
+
+### A) LEAD (no difficulty reweighting, correct-only length z-score)
+
+Using $\alpha=0.1$, incorrect penalty $=-1.0$:
+
+- LEAD rewards: $[1.1052,\ -1.0,\ 0.9048,\ -1.0]$
+- Normalized advantages: $[0.9502,\ -0.8639,\ 0.7776,\ -0.8639]$
+
+### B) Gamma-discounted reasoning
+
+Using $r_i=\gamma^{K_i}\cdot c_i$:
+
+- Rewards: $[0.20174,\ 0,\ 0.11068,\ 0]$
+- Normalized advantages: $[1.2674,\ -0.8007,\ 0.3340,\ -0.8007]$
+
+### C) GRPO-lambda (vanilla GRPO + lambda)
+
+Vanilla GRPO sequence rewards are binary: $[1,0,1,0]$.
+
+- Vanilla normalized sequence advantages: $[0.8660,\ -0.8660,\ 0.8660,\ -0.8660]$
+
+Apply token trace
+
 $$
-\begin{aligned}
-A_{2,\text{first}} &= 0\cdot 0.99^{679}=0,\\
-A_{2,\text{mid}}   &= 0\cdot 0.99^{340}=0,\\
-A_{2,\text{last}}  &= 0\cdot 0.99^{0}=0.
-\end{aligned}
+A_{i,t}^{\lambda}=A_i^{seq}\cdot 0.99^{T_i-1-t}
 $$
 
-3. Example 3: $T_3=740$, $A_3^{seq}=0$
-$$
-\begin{aligned}
-A_{3,\text{first}} &= 0\cdot 0.99^{739}=0,\\
-A_{3,\text{mid}}   &= 0\cdot 0.99^{370}=0,\\
-A_{3,\text{last}}  &= 0\cdot 0.99^{0}=0.
-\end{aligned}
-$$
+First/mid/last token values:
 
-4. Example 4: $T_4=790$, $A_4^{seq}=0$
-$$
-\begin{aligned}
-A_{4,\text{first}} &= 0\cdot 0.99^{789}=0,\\
-A_{4,\text{mid}}   &= 0\cdot 0.99^{395}=0,\\
-A_{4,\text{last}}  &= 0\cdot 0.99^{0}=0.
-\end{aligned}
-$$
+- Sample 1 ($T=1600$): $[9.08\times10^{-8},\ 2.79\times10^{-4},\ 0.8660]$
+- Sample 2 ($T=1900$): $[-4.45\times10^{-9},\ -6.18\times10^{-5},\ -0.8660]$
+- Sample 3 ($T=2200$): $[2.18\times10^{-10},\ 1.37\times10^{-5},\ 0.8660]$
+- Sample 4 ($T=2500$): $[-1.07\times10^{-11},\ -3.03\times10^{-6},\ -0.8660]$
 
-Interpretation: this isolates the exact role of lambda. Lambda only redistributes existing sequence advantage over token positions; it does not create non-zero signal when vanilla GRPO sequence advantages are all zero.
+Interpretation: with long traces and $\lambda<1$, early-token lambda credit becomes tiny. Signal is concentrated near later tokens.
 
 ---
 
@@ -276,3 +322,47 @@ Interpretation: this isolates the exact role of lambda. Lambda only redistribute
 - LEAD and discounted reasoning mostly alter sequence-level reward shaping before GRPO normalization.
 - GRPO-lambda alters token-level credit assignment after group normalization via backward traces.
 - Combining discounted reasoning with GRPO-lambda is coherent: discounting changes per-sequence outcome magnitude, then lambda redistributes that signal over token positions.
+
+---
+
+## Qualitative comparison of the three algorithms
+
+### GRPO-lambda: implicit discounting of credit, not reward
+
+- Nature of discount: implicit.
+- What is discounted: token-level credit assignment over position.
+- What is not discounted: sequence reward itself.
+- Effect: later tokens receive stronger credit, earlier tokens weaker credit, but total reward signal is not directly shrunk.
+- Practical intuition: this behaves like a mild temporal discount on gradients, not a hard penalty on long responses.
+
+### GRPO-LEAD: relative, group-based length discounting
+
+- Nature of discount: relative.
+- What is discounted: score for correct samples based on z-scored length within the group.
+- Reference frame: other rollouts for the same prompt.
+- Effect: length penalties are assigned in perspective to group behavior, so "too long" is defined relative to peer completions.
+- Practical intuition: this is a context-aware length pressure, not a fixed global token tax.
+
+### Gamma-discounted reasoning: naive global discounting
+
+- Nature of discount: direct/global.
+- What is discounted: reward magnitude itself through $\gamma^K$.
+- Reference frame: absolute reasoning-token count, independent of group-relative statistics.
+- Effect: every additional reasoning token reduces reward multiplicatively.
+- Practical intuition: this is a straightforward token-cost objective that can over-penalize long reasoning if $\gamma$ is too small.
+
+### Side-by-side takeaway
+
+- GRPO-lambda changes where credit goes.
+- LEAD changes how samples are ranked relative to peers.
+- Gamma discount changes the reward scale directly as length grows.
+
+In short: lambda is the most implicit, LEAD is relative, gamma is the most explicit and naive length penalizer.
+
+---
+
+## References
+
+- [grpo-lambda] Prasanna Parthasarathi, Mathieu Reymond, Boxing Chen, Yufei Cui, and Sarath Chandar. *GRPO-$\lambda$: Credit Assignment improves LLM Reasoning* (2025). arXiv:2510.00194. https://arxiv.org/abs/2510.00194
+- [grpo-LEAD] Jixiao Zhang and Chunsheng Zuo. *GRPO-LEAD: A Difficulty-Aware Reinforcement Learning Approach for Concise Mathematical Reasoning in Language Models* (2025). arXiv:2504.09696. https://arxiv.org/abs/2504.09696
+- [naive-discount] Alex Ayoub, Kavosh Asadi, Dale Schuurmans, Csaba Szepesvari, and Karim Bouyarmane. *Learning to Reason Efficiently with Discounted Reinforcement Learning* (2025). arXiv:2510.23486. https://arxiv.org/abs/2510.23486
