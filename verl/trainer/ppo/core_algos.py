@@ -344,15 +344,14 @@ def compute_grpo_outcome_advantage(
                 group_lengths = response_lengths[group_idx_tensor]
                 group_correct = is_correct[group_idx_tensor]
 
-                mean_len = group_lengths.mean()
-                std_len = torch.std(group_lengths, unbiased=False)
-                z = (group_lengths - mean_len) / (std_len + lead_epsilon)
-
-                group_rewards = torch.where(
-                    group_correct > 0.5,
-                    torch.exp(-lead_alpha * z),
-                    torch.full_like(z, incorrect_penalty),
-                )
+                correct_mask = group_correct > 0.5
+                group_rewards = torch.full_like(group_lengths, incorrect_penalty)
+                if torch.any(correct_mask):
+                    correct_lengths = group_lengths[correct_mask]
+                    mean_len = correct_lengths.mean()
+                    std_len = torch.std(correct_lengths, unbiased=False)
+                    z_correct = (correct_lengths - mean_len) / (std_len + lead_epsilon)
+                    group_rewards[correct_mask] = torch.exp(-lead_alpha * z_correct)
                 shaped_scores[group_idx_tensor] = group_rewards
 
                 acc_avg = group_correct.mean()
