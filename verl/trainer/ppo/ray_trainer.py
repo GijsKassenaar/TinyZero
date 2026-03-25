@@ -274,9 +274,27 @@ def compute_advantage(
             gamma=gamma,
             lam=lam,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+
+        variant_cfg = config.get("grpo_lambda_variant") if config is not None else None
+        if variant_cfg is not None:
+            if data.meta_info is None:
+                data.meta_info = {}
+            variant_enabled = bool(variant_cfg.get("enable", False))
+            data.meta_info["grpo_lambda_variant_metrics"] = {
+                "grpo_lambda_variant/flat_incorrect_trace_enabled": float(
+                    variant_enabled and bool(variant_cfg.get("flat_incorrect_trace", False))
+                ),
+                "grpo_lambda_variant/sequence_gamma_discount_enabled": float(
+                    variant_enabled and bool(variant_cfg.get("sequence_gamma_discount_enable", False))
+                ),
+                "grpo_lambda_variant/sequence_discount_gamma": float(
+                    variant_cfg.get("sequence_discount_gamma", 0.99999)
+                ),
+            }
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1992,6 +2010,10 @@ class RayPPOTrainer:
                                     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                     config=self.config.algorithm,
                                 )
+
+                            variant_metrics = batch.meta_info.pop("grpo_lambda_variant_metrics", None)
+                            if variant_metrics:
+                                metrics.update(variant_metrics)
 
                         # update critic
                         if self.use_critic:

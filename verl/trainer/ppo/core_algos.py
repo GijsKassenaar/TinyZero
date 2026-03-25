@@ -441,6 +441,10 @@ def compute_grpo_lambda_advantages(
     gamma: float = 1.0,
     lam: float = 0.9,
     epsilon: float = 1e-6,
+    flat_incorrect_trace: bool = False,
+    sequence_gamma_discount_enable: bool = False,
+    sequence_discount_gamma: float = 0.99999,
+    is_correct: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute token-level GRPO-λ advantages with backward eligibility traces.
 
@@ -472,6 +476,12 @@ def compute_grpo_lambda_advantages(
 
     # Sequence-level outcomes per sample (batch, group).
     sequence_rewards = torch.sum(rewards * mask, dim=-1)
+    valid_token_lengths = mask.sum(dim=-1)
+
+    if sequence_gamma_discount_enable:
+        discount_base = rewards.new_tensor(sequence_discount_gamma)
+        sequence_rewards = sequence_rewards * torch.pow(discount_base, valid_token_lengths)
+
     group_valid = (mask.sum(dim=-1) > 0).to(dtype=rewards.dtype)
 
     valid_group_count = group_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -483,12 +493,19 @@ def compute_grpo_lambda_advantages(
     normalized_reward = centered / (group_std + epsilon)
 
     # Backward trace exponent computed from actual valid token positions per sequence.
-    valid_token_lengths = mask.sum(dim=-1, keepdim=True)
+    valid_token_lengths = valid_token_lengths.unsqueeze(-1)
     token_positions = (torch.cumsum(mask, dim=-1) - 1.0).clamp(min=0.0)
     exponents = (valid_token_lengths - 1.0 - token_positions).clamp(min=0.0)
 
     decay_base = rewards.new_tensor(gamma * lam)
     decay_trace = torch.pow(decay_base, exponents)
+
+    if flat_incorrect_trace:
+        if is_correct is None:
+            raise ValueError("is_correct must be provided when flat_incorrect_trace=True")
+        correct_trace_mask = (is_correct > 0.5).to(dtype=rewards.dtype).unsqueeze(-1)
+        flat_trace = torch.ones_like(decay_trace)
+        decay_trace = correct_trace_mask * decay_trace + (1.0 - correct_trace_mask) * flat_trace
 
     token_advantages = normalized_reward.unsqueeze(-1) * decay_trace * mask
     return token_advantages
@@ -524,6 +541,17 @@ def compute_grpo_lambda_outcome_advantage(
         )
 
     with torch.no_grad():
+        variant_cfg = config.get("grpo_lambda_variant") if config is not None else None
+        variant_enabled = bool(variant_cfg.get("enable", False)) if variant_cfg is not None else False
+        flat_incorrect_trace = bool(variant_cfg.get("flat_incorrect_trace", False)) if variant_enabled else False
+        sequence_gamma_discount_enable = (
+            bool(variant_cfg.get("sequence_gamma_discount_enable", False)) if variant_enabled else False
+        )
+        sequence_discount_gamma = (
+            float(variant_cfg.get("sequence_discount_gamma", 0.99999)) if variant_enabled else 0.99999
+        )
+        correctness_threshold = float(variant_cfg.get("correctness_threshold", 0.5)) if variant_cfg is not None else 0.5
+
         bsz, seq_len = token_level_rewards.shape
         grouped_indices: dict[Any, list[int]] = defaultdict(list)
         for i in range(bsz):
@@ -534,6 +562,12 @@ def compute_grpo_lambda_outcome_advantage(
 
         grouped_rewards = token_level_rewards.new_zeros((num_groups, max_group_size, seq_len))
         grouped_mask = response_mask.to(dtype=token_level_rewards.dtype).new_zeros((num_groups, max_group_size, seq_len))
+        grouped_is_correct = token_level_rewards.new_zeros((num_groups, max_group_size))
+
+        sequence_rewards_flat = torch.sum(
+            token_level_rewards * response_mask.to(dtype=token_level_rewards.dtype), dim=-1
+        )
+        is_correct_flat = (sequence_rewards_flat > correctness_threshold).to(dtype=token_level_rewards.dtype)
 
         group_keys = list(grouped_indices.keys())
         for group_pos, group_key in enumerate(group_keys):
@@ -544,6 +578,7 @@ def compute_grpo_lambda_outcome_advantage(
             grouped_mask[group_pos, :n] = response_mask.index_select(0, sample_index_tensor).to(
                 dtype=token_level_rewards.dtype
             )
+            grouped_is_correct[group_pos, :n] = is_correct_flat.index_select(0, sample_index_tensor)
 
         token_advantages_grouped = compute_grpo_lambda_advantages(
             rewards=grouped_rewards,
@@ -551,12 +586,21 @@ def compute_grpo_lambda_outcome_advantage(
             gamma=gamma,
             lam=lam,
             epsilon=epsilon,
+            flat_incorrect_trace=flat_incorrect_trace,
+            sequence_gamma_discount_enable=sequence_gamma_discount_enable,
+            sequence_discount_gamma=sequence_discount_gamma,
+            is_correct=grouped_is_correct,
         )
 
         if not norm_adv_by_std_in_grpo:
             # Convert from z-score to centered-only reward by multiplying back group std.
             # We recompute centered rewards and apply the same trace shape.
             sequence_rewards = torch.sum(grouped_rewards * grouped_mask, dim=-1)
+            if sequence_gamma_discount_enable:
+                valid_lengths = grouped_mask.sum(dim=-1)
+                sequence_rewards = sequence_rewards * torch.pow(
+                    token_level_rewards.new_tensor(sequence_discount_gamma), valid_lengths
+                )
             group_valid = (grouped_mask.sum(dim=-1) > 0).to(dtype=token_level_rewards.dtype)
             valid_group_count = group_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
             group_mean = (sequence_rewards * group_valid).sum(dim=1, keepdim=True) / valid_group_count
@@ -566,6 +610,11 @@ def compute_grpo_lambda_outcome_advantage(
             token_positions = (torch.cumsum(grouped_mask, dim=-1) - 1.0).clamp(min=0.0)
             exponents = (valid_token_lengths - 1.0 - token_positions).clamp(min=0.0)
             decay_trace = torch.pow(token_level_rewards.new_tensor(gamma * lam), exponents)
+
+            if flat_incorrect_trace:
+                correct_trace_mask = (grouped_is_correct > 0.5).to(dtype=token_level_rewards.dtype).unsqueeze(-1)
+                flat_trace = torch.ones_like(decay_trace)
+                decay_trace = correct_trace_mask * decay_trace + (1.0 - correct_trace_mask) * flat_trace
 
             token_advantages_grouped = centered_reward.unsqueeze(-1) * decay_trace * grouped_mask
 

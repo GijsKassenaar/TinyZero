@@ -21,6 +21,7 @@ __all__ = [
     "AlgoConfig",
     "DiscountedReasoningConfig",
     "FilterGroupsConfig",
+    "GRPOLambdaVariantConfig",
     "HybridBranchConfig",
     "KLControlConfig",
     "LeadConfig",
@@ -100,6 +101,25 @@ class DiscountedReasoningConfig(BaseConfig):
 
     enable: bool = False
     gamma: float = 0.999
+
+
+@dataclass
+class GRPOLambdaVariantConfig(BaseConfig):
+    """Configuration for GRPO-lambda variant behavior.
+
+    Args:
+        enable (bool): Whether to enable GRPO-lambda variant behavior.
+        flat_incorrect_trace (bool): If True, incorrect samples use flat trace weights (no positional decay).
+        sequence_gamma_discount_enable (bool): If True, apply sequence-level gamma^K discount before normalization.
+        sequence_discount_gamma (float): Gamma base for sequence-level discount when enabled.
+        correctness_threshold (float): Threshold used to infer correctness from sequence reward.
+    """
+
+    enable: bool = False
+    flat_incorrect_trace: bool = False
+    sequence_gamma_discount_enable: bool = False
+    sequence_discount_gamma: float = 0.99999
+    correctness_threshold: float = 0.5
 
 
 @dataclass
@@ -553,6 +573,7 @@ class AlgoConfig(BaseConfig):
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
         discounted_reasoning (Optional[DiscountedReasoningConfig]): Exponential discount over reasoning tokens.
+        grpo_lambda_variant (Optional[GRPOLambdaVariantConfig]): GRPO-lambda variant controls.
         sgrpo (Optional[SGRPOConfig]): S-GRPO two-phase serial-group generation settings.
         hybrid_branch (Optional[HybridBranchConfig]): Hybrid branch routing settings for active S-GRPO.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
@@ -583,6 +604,7 @@ class AlgoConfig(BaseConfig):
     filter_groups: Optional[FilterGroupsConfig] = None
     lead: Optional[LeadConfig] = None
     discounted_reasoning: Optional[DiscountedReasoningConfig] = None
+    grpo_lambda_variant: Optional[GRPOLambdaVariantConfig] = None
     sgrpo: Optional[SGRPOConfig] = None
     hybrid_branch: Optional[HybridBranchConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)

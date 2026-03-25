@@ -152,6 +152,25 @@ algorithm:
     # Exponential decay base (0 < gamma <= 1)
     gamma: 0.999
 
+  # GRPO-lambda variant controls
+  grpo_lambda_variant:
+
+    # Master switch for GRPO-lambda variants
+    enable: False
+
+    # Idea 1: apply flat trace weights for incorrect samples only
+    flat_incorrect_trace: False
+
+    # Idea 2: apply sequence-level gamma^K discount before group normalization
+    sequence_gamma_discount_enable: False
+
+    # Sequence-level gamma used when sequence_gamma_discount_enable=True
+    # Chosen one order above epsilon scale (epsilon=1e-6)
+    sequence_discount_gamma: 0.99999
+
+    # Fallback threshold to infer correctness from sequence score
+    correctness_threshold: 0.5
+
   # Serial-Group Decaying-Reward Policy Optimization configuration
   sgrpo:
 
