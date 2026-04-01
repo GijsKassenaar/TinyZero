@@ -112,6 +112,16 @@ class GRPOLambdaVariantConfig(BaseConfig):
         flat_incorrect_trace (bool): If True, incorrect samples use flat trace weights (no positional decay).
         sequence_gamma_discount_enable (bool): If True, apply sequence-level gamma^K discount before normalization.
         sequence_discount_gamma (float): Gamma base for sequence-level discount when enabled.
+        reasoning_only_discount_trace_enable (bool): If True, apply sequence discount and trace weighting
+            only on reasoning tokens (inside think, before first closing think tag).
+        token_normalization_enable (bool): If True, normalize at each timestep across rollouts and
+            use post-EOS outcome carry for finished rollouts.
+        additive_normalization_enable (bool): If True and token normalization with std normalization is enabled,
+            divide by (std + tau) instead of (std + epsilon).
+        additive_normalization_tau (float): Tau offset used by additive normalization denominator.
+        second_trace_after_token_norm_enable (bool): If True, apply an additional positional
+            trace weighting after token normalization.
+        second_trace_alpha (float): Exponent used by second positional trace weighting.
         correctness_threshold (float): Threshold used to infer correctness from sequence reward.
     """
 
@@ -119,6 +129,12 @@ class GRPOLambdaVariantConfig(BaseConfig):
     flat_incorrect_trace: bool = False
     sequence_gamma_discount_enable: bool = False
     sequence_discount_gamma: float = 0.99999
+    reasoning_only_discount_trace_enable: bool = False
+    token_normalization_enable: bool = False
+    additive_normalization_enable: bool = False
+    additive_normalization_tau: float = 0.02
+    second_trace_after_token_norm_enable: bool = False
+    second_trace_alpha: float = 1.0
     correctness_threshold: float = 0.5
 
 

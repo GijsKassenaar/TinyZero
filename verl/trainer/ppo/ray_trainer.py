@@ -44,7 +44,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.adaptive_window import AdaptiveSuccessWindowConfig, AdaptiveSuccessWindowController
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
-from verl.trainer.ppo.discounted_reasoning import apply_reasoning_reward_discount
+from verl.trainer.ppo.discounted_reasoning import apply_reasoning_reward_discount, compute_reasoning_token_statistics
 from verl.trainer.ppo.metric_utils import (
     compute_completion_metrics,
     compute_data_metrics,
@@ -197,6 +197,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    tokenizer: Any = None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -267,6 +268,17 @@ def compute_advantage(
         data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.GRPO_LAMBDA:
         # GRPO-λ: group-normalized outcome reward + backward eligibility trace on valid tokens.
+        reasoning_token_mask = None
+        variant_cfg = config.get("grpo_lambda_variant") if config is not None else None
+        if variant_cfg is not None and bool(variant_cfg.get("enable", False)):
+            reasoning_only_discount_trace_enable = bool(variant_cfg.get("reasoning_only_discount_trace_enable", False))
+            if reasoning_only_discount_trace_enable:
+                if tokenizer is None:
+                    raise ValueError(
+                        "Tokenizer is required when grpo_lambda_variant.reasoning_only_discount_trace_enable=True"
+                    )
+                reasoning_token_mask, _, _, _ = compute_reasoning_token_statistics(data, tokenizer)
+
         advantages, returns = core_algos.compute_grpo_lambda_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=data.batch["response_mask"],
@@ -275,11 +287,11 @@ def compute_advantage(
             lam=lam,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
+            reasoning_token_mask=reasoning_token_mask,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
 
-        variant_cfg = config.get("grpo_lambda_variant") if config is not None else None
         if variant_cfg is not None:
             if data.meta_info is None:
                 data.meta_info = {}
@@ -291,6 +303,16 @@ def compute_advantage(
                 "grpo_lambda_variant/sequence_gamma_discount_enabled": float(
                     variant_enabled and bool(variant_cfg.get("sequence_gamma_discount_enable", False))
                 ),
+                "grpo_lambda_variant/token_normalization_enabled": float(
+                    variant_enabled and bool(variant_cfg.get("token_normalization_enable", False))
+                ),
+                "grpo_lambda_variant/reasoning_only_discount_trace_enabled": float(
+                    variant_enabled and bool(variant_cfg.get("reasoning_only_discount_trace_enable", False))
+                ),
+                "grpo_lambda_variant/second_trace_after_token_norm_enabled": float(
+                    variant_enabled and bool(variant_cfg.get("second_trace_after_token_norm_enable", False))
+                ),
+                "grpo_lambda_variant/second_trace_alpha": float(variant_cfg.get("second_trace_alpha", 1.0)),
                 "grpo_lambda_variant/sequence_discount_gamma": float(
                     variant_cfg.get("sequence_discount_gamma", 0.99999)
                 ),
@@ -2009,6 +2031,7 @@ class RayPPOTrainer:
                                     num_repeat=current_rollout_repeat_times,
                                     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                     config=self.config.algorithm,
+                                    tokenizer=self.tokenizer,
                                 )
 
                             variant_metrics = batch.meta_info.pop("grpo_lambda_variant_metrics", None)

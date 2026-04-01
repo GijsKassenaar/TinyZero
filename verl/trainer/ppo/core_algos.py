@@ -441,10 +441,18 @@ def compute_grpo_lambda_advantages(
     gamma: float = 1.0,
     lam: float = 0.9,
     epsilon: float = 1e-6,
+    normalize_by_std: bool = True,
     flat_incorrect_trace: bool = False,
     sequence_gamma_discount_enable: bool = False,
     sequence_discount_gamma: float = 0.99999,
+    token_normalization_enable: bool = False,
+    additive_normalization_enable: bool = False,
+    additive_normalization_tau: float = 0.02,
+    second_trace_after_token_norm_enable: bool = False,
+    second_trace_alpha: float = 1.0,
     is_correct: Optional[torch.Tensor] = None,
+    reasoning_token_mask: Optional[torch.Tensor] = None,
+    reasoning_only_discount_trace_enable: bool = False,
 ) -> torch.Tensor:
     """Compute token-level GRPO-λ advantages with backward eligibility traces.
 
@@ -471,34 +479,43 @@ def compute_grpo_lambda_advantages(
             "rewards and sequence_mask must have the same shape, "
             + f"got {tuple(rewards.shape)} vs {tuple(sequence_mask.shape)}"
         )
+    if reasoning_token_mask is not None and reasoning_token_mask.shape != rewards.shape:
+        raise ValueError(
+            "reasoning_token_mask must have the same shape as rewards when provided, "
+            + f"got {tuple(reasoning_token_mask.shape)} vs {tuple(rewards.shape)}"
+        )
 
     mask = sequence_mask.to(dtype=rewards.dtype)
+    trace_mask = mask
+    if reasoning_only_discount_trace_enable:
+        if reasoning_token_mask is None:
+            raise ValueError("reasoning_token_mask must be provided when reasoning_only_discount_trace_enable=True")
+        trace_mask = reasoning_token_mask.to(dtype=rewards.dtype) * mask
+
+    valid_token_lengths = mask.sum(dim=-1)
+    trace_token_lengths = trace_mask.sum(dim=-1)
 
     # Sequence-level outcomes per sample (batch, group).
     sequence_rewards = torch.sum(rewards * mask, dim=-1)
-    valid_token_lengths = mask.sum(dim=-1)
 
     if sequence_gamma_discount_enable:
         discount_base = rewards.new_tensor(sequence_discount_gamma)
-        sequence_rewards = sequence_rewards * torch.pow(discount_base, valid_token_lengths)
+        discount_lengths = trace_token_lengths if reasoning_only_discount_trace_enable else valid_token_lengths
+        sequence_rewards = sequence_rewards * torch.pow(discount_base, discount_lengths)
 
-    group_valid = (mask.sum(dim=-1) > 0).to(dtype=rewards.dtype)
-
+    group_valid = (valid_token_lengths > 0).to(dtype=rewards.dtype)
     valid_group_count = group_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
-    group_mean = (sequence_rewards * group_valid).sum(dim=1, keepdim=True) / valid_group_count
-
-    centered = (sequence_rewards - group_mean) * group_valid
-    group_var = (centered * centered).sum(dim=1, keepdim=True) / valid_group_count
-    group_std = torch.sqrt(group_var + epsilon)
-    normalized_reward = centered / (group_std + epsilon)
 
     # Backward trace exponent computed from actual valid token positions per sequence.
-    valid_token_lengths = valid_token_lengths.unsqueeze(-1)
-    token_positions = (torch.cumsum(mask, dim=-1) - 1.0).clamp(min=0.0)
-    exponents = (valid_token_lengths - 1.0 - token_positions).clamp(min=0.0)
+    valid_token_lengths_3d = trace_token_lengths.unsqueeze(-1)
+    token_positions = (torch.cumsum(trace_mask, dim=-1) - 1.0).clamp(min=0.0)
+    exponents = (valid_token_lengths_3d - 1.0 - token_positions).clamp(min=0.0)
+    exponents = exponents * trace_mask
 
     decay_base = rewards.new_tensor(gamma * lam)
     decay_trace = torch.pow(decay_base, exponents)
+    if reasoning_only_discount_trace_enable:
+        decay_trace = trace_mask * decay_trace + (1.0 - trace_mask)
 
     if flat_incorrect_trace:
         if is_correct is None:
@@ -507,7 +524,44 @@ def compute_grpo_lambda_advantages(
         flat_trace = torch.ones_like(decay_trace)
         decay_trace = correct_trace_mask * decay_trace + (1.0 - correct_trace_mask) * flat_trace
 
-    token_advantages = normalized_reward.unsqueeze(-1) * decay_trace * mask
+    if token_normalization_enable:
+        # First credit terminal outcomes backward with lambda trace, then normalize per timestep.
+        # For padded positions, exponents clamp to 0 so the traced signal naturally carries terminal outcome.
+        traced_signal = sequence_rewards.unsqueeze(-1) * decay_trace
+
+        group_valid_tokens = group_valid.unsqueeze(-1)
+        timestep_count = group_valid_tokens.sum(dim=1, keepdim=True).clamp(min=1.0)
+        timestep_mean = (traced_signal * group_valid_tokens).sum(dim=1, keepdim=True) / timestep_count
+        timestep_centered = (traced_signal - timestep_mean) * group_valid_tokens
+
+        if normalize_by_std:
+            timestep_var = (timestep_centered * timestep_centered).sum(dim=1, keepdim=True) / timestep_count
+            timestep_std = torch.sqrt(timestep_var + epsilon)
+            if additive_normalization_enable:
+                tau = max(float(additive_normalization_tau), float(epsilon))
+                normalized_signal = timestep_centered / (timestep_std + tau)
+            else:
+                normalized_signal = timestep_centered / (timestep_std + epsilon)
+        else:
+            normalized_signal = timestep_centered
+
+        token_advantages = normalized_signal * mask
+        if second_trace_after_token_norm_enable:
+            post_norm_trace = torch.pow(decay_trace, second_trace_alpha)
+            token_advantages = token_advantages * post_norm_trace * mask
+    else:
+        group_mean = (sequence_rewards * group_valid).sum(dim=1, keepdim=True) / valid_group_count
+        centered = (sequence_rewards - group_mean) * group_valid
+
+        if normalize_by_std:
+            group_var = (centered * centered).sum(dim=1, keepdim=True) / valid_group_count
+            group_std = torch.sqrt(group_var + epsilon)
+            normalized_reward = centered / (group_std + epsilon)
+        else:
+            normalized_reward = centered
+
+        token_advantages = normalized_reward.unsqueeze(-1) * decay_trace * mask
+
     return token_advantages
 
 
@@ -521,6 +575,7 @@ def compute_grpo_lambda_outcome_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    reasoning_token_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute GRPO-λ token-level advantages for flattened grouped trajectories.
 
@@ -550,6 +605,20 @@ def compute_grpo_lambda_outcome_advantage(
         sequence_discount_gamma = (
             float(variant_cfg.get("sequence_discount_gamma", 0.99999)) if variant_enabled else 0.99999
         )
+        reasoning_only_discount_trace_enable = (
+            bool(variant_cfg.get("reasoning_only_discount_trace_enable", False)) if variant_enabled else False
+        )
+        token_normalization_enable = bool(variant_cfg.get("token_normalization_enable", False)) if variant_enabled else False
+        additive_normalization_enable = (
+            bool(variant_cfg.get("additive_normalization_enable", False)) if variant_enabled else False
+        )
+        additive_normalization_tau = (
+            float(variant_cfg.get("additive_normalization_tau", 0.02)) if variant_enabled else 0.02
+        )
+        second_trace_after_token_norm_enable = (
+            bool(variant_cfg.get("second_trace_after_token_norm_enable", False)) if variant_enabled else False
+        )
+        second_trace_alpha = float(variant_cfg.get("second_trace_alpha", 1.0)) if variant_enabled else 1.0
         correctness_threshold = float(variant_cfg.get("correctness_threshold", 0.5)) if variant_cfg is not None else 0.5
 
         bsz, seq_len = token_level_rewards.shape
@@ -562,6 +631,11 @@ def compute_grpo_lambda_outcome_advantage(
 
         grouped_rewards = token_level_rewards.new_zeros((num_groups, max_group_size, seq_len))
         grouped_mask = response_mask.to(dtype=token_level_rewards.dtype).new_zeros((num_groups, max_group_size, seq_len))
+        grouped_reasoning_mask = None
+        if reasoning_token_mask is not None:
+            grouped_reasoning_mask = response_mask.to(dtype=token_level_rewards.dtype).new_zeros(
+                (num_groups, max_group_size, seq_len)
+            )
         grouped_is_correct = token_level_rewards.new_zeros((num_groups, max_group_size))
 
         sequence_rewards_flat = torch.sum(
@@ -578,6 +652,10 @@ def compute_grpo_lambda_outcome_advantage(
             grouped_mask[group_pos, :n] = response_mask.index_select(0, sample_index_tensor).to(
                 dtype=token_level_rewards.dtype
             )
+            if grouped_reasoning_mask is not None:
+                grouped_reasoning_mask[group_pos, :n] = reasoning_token_mask.index_select(0, sample_index_tensor).to(
+                    dtype=token_level_rewards.dtype
+                )
             grouped_is_correct[group_pos, :n] = is_correct_flat.index_select(0, sample_index_tensor)
 
         token_advantages_grouped = compute_grpo_lambda_advantages(
@@ -586,37 +664,19 @@ def compute_grpo_lambda_outcome_advantage(
             gamma=gamma,
             lam=lam,
             epsilon=epsilon,
+            normalize_by_std=norm_adv_by_std_in_grpo,
             flat_incorrect_trace=flat_incorrect_trace,
             sequence_gamma_discount_enable=sequence_gamma_discount_enable,
             sequence_discount_gamma=sequence_discount_gamma,
+            token_normalization_enable=token_normalization_enable,
+            additive_normalization_enable=additive_normalization_enable,
+            additive_normalization_tau=additive_normalization_tau,
+            second_trace_after_token_norm_enable=second_trace_after_token_norm_enable,
+            second_trace_alpha=second_trace_alpha,
             is_correct=grouped_is_correct,
+            reasoning_token_mask=grouped_reasoning_mask,
+            reasoning_only_discount_trace_enable=reasoning_only_discount_trace_enable,
         )
-
-        if not norm_adv_by_std_in_grpo:
-            # Convert from z-score to centered-only reward by multiplying back group std.
-            # We recompute centered rewards and apply the same trace shape.
-            sequence_rewards = torch.sum(grouped_rewards * grouped_mask, dim=-1)
-            if sequence_gamma_discount_enable:
-                valid_lengths = grouped_mask.sum(dim=-1)
-                sequence_rewards = sequence_rewards * torch.pow(
-                    token_level_rewards.new_tensor(sequence_discount_gamma), valid_lengths
-                )
-            group_valid = (grouped_mask.sum(dim=-1) > 0).to(dtype=token_level_rewards.dtype)
-            valid_group_count = group_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
-            group_mean = (sequence_rewards * group_valid).sum(dim=1, keepdim=True) / valid_group_count
-            centered_reward = (sequence_rewards - group_mean) * group_valid
-
-            valid_token_lengths = grouped_mask.sum(dim=-1, keepdim=True)
-            token_positions = (torch.cumsum(grouped_mask, dim=-1) - 1.0).clamp(min=0.0)
-            exponents = (valid_token_lengths - 1.0 - token_positions).clamp(min=0.0)
-            decay_trace = torch.pow(token_level_rewards.new_tensor(gamma * lam), exponents)
-
-            if flat_incorrect_trace:
-                correct_trace_mask = (grouped_is_correct > 0.5).to(dtype=token_level_rewards.dtype).unsqueeze(-1)
-                flat_trace = torch.ones_like(decay_trace)
-                decay_trace = correct_trace_mask * decay_trace + (1.0 - correct_trace_mask) * flat_trace
-
-            token_advantages_grouped = centered_reward.unsqueeze(-1) * decay_trace * grouped_mask
 
         token_advantages = torch.zeros_like(token_level_rewards)
         for group_pos, group_key in enumerate(group_keys):

@@ -168,6 +168,25 @@ algorithm:
     # Chosen one order above epsilon scale (epsilon=1e-6)
     sequence_discount_gamma: 0.99999
 
+    # If True, apply sequence discount and trace weighting only on reasoning tokens
+    # inside think tags (before first closing think tag)
+    reasoning_only_discount_trace_enable: False
+
+    # Idea 3: token normalization per timestep across rollouts with post-EOS outcome carry
+    token_normalization_enable: False
+
+    # Optional additive denominator for token normalization: centered / (std + tau)
+    additive_normalization_enable: False
+
+    # Tau used when additive_normalization_enable=True
+    additive_normalization_tau: 0.02
+
+    # Idea 4: apply a second positional trace weighting after token normalization
+    second_trace_after_token_norm_enable: False
+
+    # Strength for Idea 4 weighting as decay_trace^alpha
+    second_trace_alpha: 1.0
+
     # Fallback threshold to infer correctness from sequence score
     correctness_threshold: 0.5
 

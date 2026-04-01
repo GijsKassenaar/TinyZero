@@ -48,6 +48,52 @@ def _extract_reasoning_spans(response_text: str) -> tuple[list[str], bool]:
     return [], False
 
 
+def compute_reasoning_token_statistics(
+    batch: DataProto,
+    tokenizer: Any,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute reasoning-token mask/statistics from prompt-prefilled think responses.
+
+    Returns:
+        reasoning_mask: Bool tensor of shape (bs, response_len_max) with reasoning tokens set True.
+        reasoning_lengths: Float tensor of shape (bs,) containing reasoning token counts K.
+        closed_think: Bool tensor of shape (bs,) indicating whether a closing think tag was found.
+        valid_response_lengths: Long tensor of shape (bs,) with valid response lengths from attention mask.
+    """
+    responses = batch.batch["responses"]
+    response_len_max = responses.size(1)
+    response_mask = batch.batch["attention_mask"][:, -response_len_max:]
+    valid_response_lengths = response_mask.sum(-1).to(dtype=torch.long)
+
+    reasoning_mask = torch.zeros_like(response_mask, dtype=torch.bool)
+    reasoning_lengths = torch.zeros(responses.size(0), dtype=torch.float32, device=responses.device)
+    closed_think = torch.zeros(responses.size(0), dtype=torch.bool, device=responses.device)
+
+    for i in range(responses.size(0)):
+        valid_len = int(valid_response_lengths[i].item())
+        if valid_len <= 0:
+            continue
+
+        response_ids = responses[i, :valid_len].tolist()
+        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
+
+        spans, has_close_tag = _extract_reasoning_spans(response_text)
+        closed_think[i] = bool(has_close_tag)
+        if not has_close_tag:
+            continue
+
+        reasoning_token_count = 0
+        for span in spans:
+            reasoning_token_count += _tokenize_text_length(span, tokenizer)
+
+        reasoning_token_count = min(int(reasoning_token_count), valid_len)
+        reasoning_lengths[i] = float(reasoning_token_count)
+        if reasoning_token_count > 0:
+            reasoning_mask[i, :reasoning_token_count] = True
+
+    return reasoning_mask, reasoning_lengths, closed_think, valid_response_lengths
+
+
 def apply_reasoning_reward_discount(
     batch: DataProto,
     reward_tensor: torch.Tensor,
@@ -59,33 +105,13 @@ def apply_reasoning_reward_discount(
     if gamma <= 0.0 or gamma > 1.0:
         raise ValueError(f"discounted_reasoning.gamma must satisfy 0 < gamma <= 1, got {gamma}")
 
-    responses = batch.batch["responses"]
-    response_len_max = responses.size(1)
-    response_mask = batch.batch["attention_mask"][:, -response_len_max:]
-    valid_response_lengths = response_mask.sum(-1).to(dtype=torch.long)
-
-    reasoning_lengths = []
-    closed_think = []
-    for i in range(responses.size(0)):
-        valid_len = int(valid_response_lengths[i].item())
-        if valid_len <= 0:
-            reasoning_lengths.append(0.0)
-            closed_think.append(False)
-            continue
-
-        response_ids = responses[i, :valid_len].tolist()
-        response_text = tokenizer.decode(response_ids, skip_special_tokens=True)
-
-        spans, has_close_tag = _extract_reasoning_spans(response_text)
-        reasoning_token_count = 0
-        for span in spans:
-            reasoning_token_count += _tokenize_text_length(span, tokenizer)
-
-        reasoning_lengths.append(float(reasoning_token_count))
-        closed_think.append(bool(has_close_tag))
-
-    reasoning_lengths_tensor = torch.tensor(reasoning_lengths, dtype=torch.float32, device=reward_tensor.device)
-    closed_think_tensor = torch.tensor(closed_think, dtype=torch.bool, device=reward_tensor.device)
+    _, reasoning_lengths_tensor, closed_think_tensor, valid_response_lengths = compute_reasoning_token_statistics(
+        batch=batch,
+        tokenizer=tokenizer,
+    )
+    reasoning_lengths_tensor = reasoning_lengths_tensor.to(device=reward_tensor.device, dtype=torch.float32)
+    closed_think_tensor = closed_think_tensor.to(device=reward_tensor.device, dtype=torch.bool)
+    valid_response_lengths = valid_response_lengths.to(device=reward_tensor.device, dtype=torch.long)
     valid_reasoning_mask = (valid_response_lengths > 0) & closed_think_tensor
     discount_factors = torch.pow(
         torch.full_like(reasoning_lengths_tensor, gamma, dtype=torch.float32),
