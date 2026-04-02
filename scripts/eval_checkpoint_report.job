@@ -1,0 +1,37 @@
+#!/bin/bash
+# Run 6-checkpoint validation report with trainer-style val-only pipeline.
+# No arguments required; uses built-in defaults and current checkpoint locations.
+
+#SBATCH --job-name=tinyzero_eval_report
+#SBATCH --partition=gpu_h100
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=600G
+#SBATCH --time=04:00:00
+
+module purge
+module load 2025
+module load CUDA/12.8.0
+
+source ~/.bashrc
+conda activate zero
+
+# Ensure ROCm vars do not conflict with CUDA
+unset ROCR_VISIBLE_DEVICES
+unset HIP_VISIBLE_DEVICES
+
+export HF_HOME=/scratch-shared/$USER/huggingface
+mkdir -p "$HF_HOME"
+export WANDB__SERVICE_WAIT=300
+export WANDB_DIR=/scratch-shared/$USER/wandb
+mkdir -p "$WANDB_DIR"
+
+cd "$HOME/TinyZero"
+
+# Default settings are already encoded in the wrapper:
+# - built-in six checkpoints
+# - trainer-style val-only validation
+# - random 20 samples from test split (seed=42)
+# - sequential evaluation and consolidated report outputs
+bash scripts/run_checkpoint_eval_report.sh
