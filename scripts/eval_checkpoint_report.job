@@ -1,5 +1,6 @@
 #!/bin/bash
-# Run 6-checkpoint validation report with trainer-style val-only pipeline.
+# Run checkpoint validation report with trainer-style val-only pipeline,
+# then run quick comparative analysis on the produced outputs.
 # No arguments required; uses built-in defaults and current checkpoint locations.
 
 #SBATCH --job-name=tinyzero_eval_report
@@ -30,8 +31,42 @@ mkdir -p "$WANDB_DIR"
 cd "$HOME/TinyZero"
 
 # Default settings are already encoded in the wrapper:
-# - built-in six checkpoints
+# - built-in checkpoint set
 # - trainer-style val-only validation
 # - random 20 samples from test split (seed=42)
 # - sequential evaluation and consolidated report outputs
-bash scripts/run_checkpoint_eval_report.sh
+
+EXISTING_RUN_DIR=$(ls -1d reports/checkpoint_eval/checkpoint_eval_* 2>/dev/null | sort | tail -n1)
+if [[ -z "${EXISTING_RUN_DIR}" ]]; then
+	echo "No existing checkpoint_eval run found under reports/checkpoint_eval"
+	exit 1
+fi
+
+NEW_MODEL_CKPT=$(ls -1d test_grpo_lambda_0.99_reasoning_only/global_step_* 2>/dev/null | sort | tail -n1)
+
+if [[ -z "${NEW_MODEL_CKPT}" ]]; then
+	# Fallback for runs saved under alternate 0.99 reasoning-only-like names.
+	mapfile -t CKPT_CANDIDATES < <(
+		find . -maxdepth 3 -type d -name 'global_step_*' \
+		| grep -E '/[^/]*grpo_lambda[^/]*0\.99([^0-9]|$)[^/]*(reasoning|sequence_gamma_discount)[^/]*/global_step_[0-9]+$' \
+		| sort
+	)
+
+	if [[ ${#CKPT_CANDIDATES[@]} -eq 0 ]]; then
+		echo "No checkpoint found under test_grpo_lambda_0.99_reasoning_only/global_step_*"
+		echo "Also did not find fallback candidates matching '*grpo_lambda*0.99*(reasoning|sequence_gamma_discount)*/global_step_*'."
+		echo "Available GRPO-lambda checkpoints:"
+		find . -maxdepth 3 -type d -name 'global_step_*' | grep -E '/[^/]*grpo_lambda[^/]*/global_step_[0-9]+$' | sort
+		exit 1
+	fi
+
+	NEW_MODEL_CKPT="${CKPT_CANDIDATES[-1]}"
+fi
+
+echo "Resolved new model checkpoint: ${NEW_MODEL_CKPT}"
+
+bash scripts/run_checkpoint_eval_report.sh \
+	--checkpoints "${NEW_MODEL_CKPT}" \
+	--append-run-dir "${EXISTING_RUN_DIR}"
+
+python3 scripts/analyze_checkpoint_eval_outputs.py --run-dir "${EXISTING_RUN_DIR}"

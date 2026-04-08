@@ -6,7 +6,7 @@ by launching `python -m verl.trainer.main_ppo` in val-only resume mode for each
 checkpoint, one checkpoint at a time.
 
 Key behavior:
-- Uses checkpoint-specific training profiles (matching the six experiment scripts).
+- Uses checkpoint-specific training profiles (matching the checkpoint experiments).
 - Limits evaluation set size by materializing a subset parquet (default: random 20 rows).
 - Stores raw run logs and validation JSONL dumps per checkpoint.
 - Produces summary CSV/JSON/Markdown report files.
@@ -23,7 +23,7 @@ import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -48,6 +48,11 @@ DEFAULT_CHECKPOINTS = [
         "name": "test_grpo_lambda_sequence_gamma_discount",
         "path": "test_grpo_lambda_sequence_gamma_discount/global_step_75",
         "profile": "grpo_lambda_sequence_gamma_discount",
+    },
+    {
+        "name": "test_grpo_lambda_0.99_token_normalization",
+        "path": "test_grpo_lambda_0.99_token_normalization/global_step_75",
+        "profile": "grpo_lambda_token_normalization_0p99",
     },
     {
         "name": "test_grpo_lambda_0.999_token_normalization",
@@ -101,12 +106,43 @@ PROFILE_OVERRIDES: dict[str, list[str]] = {
         "algorithm.grpo_lambda_variant.sequence_discount_gamma=0.99999999",
         "algorithm.grpo_lambda_variant.reasoning_only_discount_trace_enable=True",
     ],
+    "grpo_lambda_reasoning_only_0p99": [
+        "actor_rollout_ref.actor.policy_loss.loss_mode=grpo_lambda",
+        "critic.enable=False",
+        "algorithm.adv_estimator=grpo_lambda",
+        "algorithm.gamma=1.0",
+        "algorithm.lam=0.99",
+        "algorithm.norm_adv_by_std_in_grpo=True",
+        "algorithm.use_kl_in_reward=False",
+        "algorithm.kl_ctrl.kl_coef=0.001",
+        "algorithm.grpo_lambda_variant.enable=True",
+        "algorithm.grpo_lambda_variant.flat_incorrect_trace=False",
+        "algorithm.grpo_lambda_variant.sequence_gamma_discount_enable=True",
+        "algorithm.grpo_lambda_variant.sequence_discount_gamma=0.99999999",
+        "algorithm.grpo_lambda_variant.reasoning_only_discount_trace_enable=True",
+    ],
     "grpo_lambda_token_normalization": [
         "actor_rollout_ref.actor.policy_loss.loss_mode=grpo_lambda",
         "critic.enable=False",
         "algorithm.adv_estimator=grpo_lambda",
         "algorithm.gamma=1.0",
         "algorithm.lam=0.999",
+        "algorithm.norm_adv_by_std_in_grpo=True",
+        "algorithm.use_kl_in_reward=False",
+        "algorithm.kl_ctrl.kl_coef=0.001",
+        "algorithm.grpo_lambda_variant.enable=True",
+        "algorithm.grpo_lambda_variant.flat_incorrect_trace=False",
+        "algorithm.grpo_lambda_variant.sequence_gamma_discount_enable=False",
+        "algorithm.grpo_lambda_variant.sequence_discount_gamma=0.99999",
+        "algorithm.grpo_lambda_variant.reasoning_only_discount_trace_enable=False",
+        "algorithm.grpo_lambda_variant.token_normalization_enable=True",
+    ],
+    "grpo_lambda_token_normalization_0p99": [
+        "actor_rollout_ref.actor.policy_loss.loss_mode=grpo_lambda",
+        "critic.enable=False",
+        "algorithm.adv_estimator=grpo_lambda",
+        "algorithm.gamma=1.0",
+        "algorithm.lam=0.99",
         "algorithm.norm_adv_by_std_in_grpo=True",
         "algorithm.use_kl_in_reward=False",
         "algorithm.kl_ctrl.kl_coef=0.001",
@@ -148,10 +184,15 @@ class EvalResult:
     duration_sec: float
     mean_reward: Optional[float]
     accuracy: Optional[float]
+    mean_response_length_correct: Optional[float]
+    mean_response_length_incorrect: Optional[float]
+    mean_reasoning_length_correct: Optional[float]
+    mean_reasoning_length_incorrect: Optional[float]
     num_records: int
     status: str
     log_file: str
     generation_dump: str
+    readable_dump: str
     error: str
 
 
@@ -237,6 +278,15 @@ def parse_args() -> argparse.Namespace:
         default=sys.executable,
         help="Python executable used for subprocess commands.",
     )
+    parser.add_argument(
+        "--append-run-dir",
+        type=str,
+        default=None,
+        help=(
+            "If set, append/update evaluated checkpoint rows in an existing checkpoint_eval run directory "
+            "instead of creating a new run folder."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -252,6 +302,16 @@ def infer_profile(path_text: str) -> str:
     lower = path_text.lower()
     if "discounted_reasoning" in lower:
         return "discounted_reasoning"
+    if "reasoning_only" in lower and "grpo_lambda" in lower:
+        if "0.99" in lower and "0.999" not in lower:
+            return "grpo_lambda_reasoning_only_0p99"
+        return "grpo_lambda_sequence_gamma_discount"
+    if "0.999" in lower and "token_normalization" in lower:
+        return "grpo_lambda_token_normalization"
+    if "0.99_token_normalization" in lower:
+        return "grpo_lambda_token_normalization_0p99"
+    if "0.99" in lower and "token" in lower and "grpo_lambda" in lower and "0.999" not in lower:
+        return "grpo_lambda_token_normalization_0p99"
     if "sequence_gamma_discount" in lower:
         return "grpo_lambda_sequence_gamma_discount"
     if "second_trace" in lower:
@@ -318,6 +378,10 @@ def build_checkpoint_items(args: argparse.Namespace) -> list[dict[str, str]]:
         name = Path(raw).name
         if name in ("actor", "huggingface"):
             name = Path(raw).parent.name
+        elif name.startswith("global_step_"):
+            parent_name = Path(raw).parent.name
+            if parent_name:
+                name = parent_name
         items.append({"name": name, "path": raw, "profile": profile})
 
     return items
@@ -377,31 +441,233 @@ def newest_jsonl_file(path: Path) -> Optional[Path]:
     return files[-1]
 
 
-def parse_generation_dump(jsonl_path: Path) -> tuple[Optional[float], Optional[float], int]:
+def mean_or_none(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    return float(sum(values) / len(values))
+
+
+def collapse_preview(text: str, limit: int = 240) -> str:
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    return flat[: limit - 3] + "..."
+
+
+def extract_reasoning_text(output_text: str) -> str:
+    if "</think>" in output_text:
+        return output_text.split("</think>", 1)[0]
+    return output_text
+
+
+def load_checkpoint_tokenizer(resume_path: Path, base_model: str) -> tuple[Optional[Any], str]:
+    try:
+        from transformers import AutoTokenizer
+    except Exception as exc:  # pylint: disable=broad-except
+        return None, f"Could not import transformers: {exc}"
+
+    candidates: list[tuple[str, bool]] = []
+    local_hf = resume_path / "actor" / "huggingface"
+    if local_hf.is_dir():
+        candidates.append((str(local_hf), True))
+    candidates.append((base_model, False))
+
+    errors: list[str] = []
+    for source, local_only in candidates:
+        kwargs = {"trust_remote_code": True}
+        if local_only:
+            kwargs["local_files_only"] = True
+        try:
+            try:
+                tokenizer = AutoTokenizer.from_pretrained(source, fix_mistral_regex=True, **kwargs)
+            except TypeError:
+                tokenizer = AutoTokenizer.from_pretrained(source, **kwargs)
+            return tokenizer, ""
+        except Exception as exc:  # pylint: disable=broad-except
+            errors.append(f"{source}: {exc}")
+
+    return None, "; ".join(errors)
+
+
+def parse_generation_dump(
+    jsonl_path: Path,
+    tokenizer: Optional[Any],
+    readable_dump_path: Optional[Path] = None,
+) -> dict[str, Any]:
     scores: list[float] = []
+    response_len_correct: list[float] = []
+    response_len_incorrect: list[float] = []
+    reasoning_len_correct: list[float] = []
+    reasoning_len_incorrect: list[float] = []
+    readable_rows: list[dict[str, Any]] = []
+
     with jsonl_path.open() as f:
-        for line in f:
+        for idx, line in enumerate(f):
             line = line.strip()
             if not line:
                 continue
+
             row = json.loads(line)
+            score: Optional[float] = None
             if "score" in row:
-                scores.append(float(row["score"]))
+                score = float(row["score"])
             elif "reward" in row:
-                scores.append(float(row["reward"]))
+                score = float(row["reward"])
+
+            if score is not None:
+                scores.append(score)
+
+            output_raw = row.get("output", "")
+            if isinstance(output_raw, str):
+                output_text = output_raw
+            elif output_raw is None:
+                output_text = ""
+            else:
+                output_text = str(output_raw)
+
+            input_raw = row.get("input", "")
+            if isinstance(input_raw, str):
+                input_text = input_raw
+            elif input_raw is None:
+                input_text = ""
+            else:
+                input_text = str(input_raw)
+
+            is_correct = bool(score is not None and score >= 0.99)
+            response_len_tokens: Optional[int] = None
+            reasoning_len_tokens: Optional[int] = None
+            if tokenizer is not None:
+                response_len_tokens = int(len(tokenizer.encode(output_text, add_special_tokens=False)))
+                reasoning_text = extract_reasoning_text(output_text)
+                reasoning_len_tokens = int(len(tokenizer.encode(reasoning_text, add_special_tokens=False)))
+
+                if is_correct:
+                    response_len_correct.append(float(response_len_tokens))
+                    reasoning_len_correct.append(float(reasoning_len_tokens))
+                else:
+                    response_len_incorrect.append(float(response_len_tokens))
+                    reasoning_len_incorrect.append(float(reasoning_len_tokens))
+
+            readable_rows.append(
+                {
+                    "idx": idx,
+                    "step": row.get("step"),
+                    "score": score,
+                    "is_correct": is_correct,
+                    "response_len_tokens": response_len_tokens,
+                    "reasoning_len_tokens": reasoning_len_tokens,
+                    "input_preview": collapse_preview(input_text),
+                    "output_preview": collapse_preview(output_text),
+                }
+            )
+
+    readable_path_text = ""
+    if readable_dump_path is not None:
+        readable_dump_path.parent.mkdir(parents=True, exist_ok=True)
+        with readable_dump_path.open("w") as f:
+            for row in readable_rows:
+                f.write(json.dumps(row) + "\n")
+        readable_path_text = str(readable_dump_path)
 
     if not scores:
-        return None, None, 0
+        return {
+            "mean_reward": None,
+            "accuracy": None,
+            "num_records": 0,
+            "mean_response_length_correct": mean_or_none(response_len_correct),
+            "mean_response_length_incorrect": mean_or_none(response_len_incorrect),
+            "mean_reasoning_length_correct": mean_or_none(reasoning_len_correct),
+            "mean_reasoning_length_incorrect": mean_or_none(reasoning_len_incorrect),
+            "readable_dump": readable_path_text,
+        }
 
     mean_reward = float(sum(scores) / len(scores))
     accuracy = float(sum(1 for x in scores if x >= 0.99) / len(scores))
-    return mean_reward, accuracy, len(scores)
+    return {
+        "mean_reward": mean_reward,
+        "accuracy": accuracy,
+        "num_records": len(scores),
+        "mean_response_length_correct": mean_or_none(response_len_correct),
+        "mean_response_length_incorrect": mean_or_none(response_len_incorrect),
+        "mean_reasoning_length_correct": mean_or_none(reasoning_len_correct),
+        "mean_reasoning_length_incorrect": mean_or_none(reasoning_len_incorrect),
+        "readable_dump": readable_path_text,
+    }
 
 
 def markdown_float(x: Optional[float]) -> str:
     if x is None:
         return "N/A"
     return f"{x:.4f}"
+
+
+def _to_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    try:
+        return float(text)
+    except Exception:
+        return None
+
+
+def _to_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    try:
+        return int(float(text))
+    except Exception:
+        return None
+
+
+def load_summary_rows(summary_csv: Path) -> tuple[list[str], list[dict[str, object]]]:
+    if not summary_csv.exists():
+        return [], []
+    with summary_csv.open() as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames) if reader.fieldnames else []
+        rows = list(reader)
+    return fieldnames, rows
+
+
+def merge_existing_and_new_rows(
+    existing_rows: list[dict[str, object]],
+    new_rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    def row_key(row: dict[str, object]) -> str:
+        checkpoint_path = str(row.get("checkpoint_path", "")).strip()
+        if checkpoint_path:
+            return f"cp::{checkpoint_path}"
+        name = str(row.get("name", "")).strip()
+        return f"name::{name}"
+
+    merged: dict[str, dict[str, object]] = {}
+    order: list[str] = []
+
+    for row in existing_rows:
+        key = row_key(row)
+        if key in ("cp::", "name::"):
+            continue
+        if key not in merged:
+            order.append(key)
+            merged[key] = {}
+        merged[key].update(row)
+
+    for row in new_rows:
+        key = row_key(row)
+        if key in ("cp::", "name::"):
+            continue
+        if key not in merged:
+            order.append(key)
+            merged[key] = {}
+        merged[key].update(row)
+
+    return [merged[key] for key in order]
 
 
 def main() -> int:
@@ -414,8 +680,16 @@ def main() -> int:
         print("No checkpoints provided.")
         return 1
 
-    run_name = args.run_name or f"checkpoint_eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    run_dir = Path(args.output_dir).expanduser() / run_name
+    if args.append_run_dir:
+        run_dir = Path(args.append_run_dir).expanduser()
+        if not run_dir.is_absolute():
+            run_dir = (repo_root / run_dir).resolve()
+        if not run_dir.exists():
+            raise FileNotFoundError(f"append-run-dir does not exist: {run_dir}")
+        run_name = run_dir.name
+    else:
+        run_name = args.run_name or f"checkpoint_eval_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_dir = Path(args.output_dir).expanduser() / run_name
     logs_dir = run_dir / "logs"
     subset_dir = run_dir / "subsets"
     validation_dump_dir = run_dir / "validation_data"
@@ -437,22 +711,35 @@ def main() -> int:
         dst_path=subset_path,
     )
 
-    metadata = {
-        "run_name": run_name,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "repo_root": str(repo_root),
-        "data_dir": str(data_dir),
-        "split": args.split,
-        "sample_count_requested": args.sample_count,
-        "sample_count_written": subset_rows,
-        "sample_mode": args.sample_mode,
-        "sample_seed": args.sample_seed,
-        "split_total_rows": total_rows,
-        "subset_path": str(subset_path),
-        "args": vars(args),
-        "checkpoints": checkpoints,
-    }
-    (run_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+    metadata_path = run_dir / "metadata.json"
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except Exception:
+            metadata = {}
+    else:
+        metadata = {}
+
+    metadata.update(
+        {
+            "run_name": run_name,
+            "repo_root": str(repo_root),
+            "data_dir": str(data_dir),
+            "split": args.split,
+            "sample_count_requested": args.sample_count,
+            "sample_count_written": subset_rows,
+            "sample_mode": args.sample_mode,
+            "sample_seed": args.sample_seed,
+            "split_total_rows": total_rows,
+            "subset_path": str(subset_path),
+            "last_update_at": datetime.now().isoformat(timespec="seconds"),
+            "last_update_args": vars(args),
+            "last_update_checkpoints": checkpoints,
+        }
+    )
+    if "created_at" not in metadata:
+        metadata["created_at"] = datetime.now().isoformat(timespec="seconds")
+    metadata_path.write_text(json.dumps(metadata, indent=2))
 
     logger_value = logger_literal(args.logger)
     results: list[EvalResult] = []
@@ -473,10 +760,15 @@ def main() -> int:
                     duration_sec=0.0,
                     mean_reward=None,
                     accuracy=None,
+                    mean_response_length_correct=None,
+                    mean_response_length_incorrect=None,
+                    mean_reasoning_length_correct=None,
+                    mean_reasoning_length_incorrect=None,
                     num_records=0,
                     status="failed",
                     log_file=str(logs_dir / f"{name}.validate.log"),
                     generation_dump="",
+                    readable_dump="",
                     error=f"Unknown profile: {profile}",
                 )
             )
@@ -555,10 +847,15 @@ def main() -> int:
                         duration_sec=duration_sec,
                         mean_reward=None,
                         accuracy=None,
+                        mean_response_length_correct=None,
+                        mean_response_length_incorrect=None,
+                        mean_reasoning_length_correct=None,
+                        mean_reasoning_length_incorrect=None,
                         num_records=0,
                         status="failed",
                         log_file=str(log_path),
                         generation_dump="",
+                        readable_dump="",
                         error="Validation command failed. See log file.",
                     )
                 )
@@ -576,18 +873,43 @@ def main() -> int:
                         duration_sec=duration_sec,
                         mean_reward=None,
                         accuracy=None,
+                        mean_response_length_correct=None,
+                        mean_response_length_incorrect=None,
+                        mean_reasoning_length_correct=None,
+                        mean_reasoning_length_incorrect=None,
                         num_records=0,
                         status="failed",
                         log_file=str(log_path),
                         generation_dump="",
+                        readable_dump="",
                         error="No validation JSONL dump found.",
                     )
                 )
                 continue
 
-            mean_reward, accuracy, num_records = parse_generation_dump(dump_file)
+            tokenizer, tokenizer_error = load_checkpoint_tokenizer(resume_path, args.base_model)
+            readable_dump_path = dump_file.with_suffix(".readable.jsonl")
+            parsed = parse_generation_dump(
+                dump_file,
+                tokenizer=tokenizer,
+                readable_dump_path=readable_dump_path,
+            )
+            mean_reward = parsed["mean_reward"]
+            accuracy = parsed["accuracy"]
+            num_records = int(parsed["num_records"])
+            mean_response_length_correct = parsed["mean_response_length_correct"]
+            mean_response_length_incorrect = parsed["mean_response_length_incorrect"]
+            mean_reasoning_length_correct = parsed["mean_reasoning_length_correct"]
+            mean_reasoning_length_incorrect = parsed["mean_reasoning_length_incorrect"]
+            readable_dump = str(parsed["readable_dump"])
+
             status = "ok" if mean_reward is not None and accuracy is not None else "ok_no_scores"
-            error = "" if status == "ok" else "Validation completed but no score fields found in dump."
+            error_parts: list[str] = []
+            if status != "ok":
+                error_parts.append("Validation completed but no score fields found in dump.")
+            if tokenizer is None:
+                error_parts.append(f"Tokenizer unavailable for length metrics: {tokenizer_error}")
+            error = " | ".join(error_parts)
 
             results.append(
                 EvalResult(
@@ -599,10 +921,15 @@ def main() -> int:
                     duration_sec=duration_sec,
                     mean_reward=mean_reward,
                     accuracy=accuracy,
+                    mean_response_length_correct=mean_response_length_correct,
+                    mean_response_length_incorrect=mean_response_length_incorrect,
+                    mean_reasoning_length_correct=mean_reasoning_length_correct,
+                    mean_reasoning_length_incorrect=mean_reasoning_length_incorrect,
                     num_records=num_records,
                     status=status,
                     log_file=str(log_path),
                     generation_dump=str(dump_file),
+                    readable_dump=readable_dump,
                     error=error,
                 )
             )
@@ -618,23 +945,42 @@ def main() -> int:
                     duration_sec=0.0,
                     mean_reward=None,
                     accuracy=None,
+                    mean_response_length_correct=None,
+                    mean_response_length_incorrect=None,
+                    mean_reasoning_length_correct=None,
+                    mean_reasoning_length_incorrect=None,
                     num_records=0,
                     status="failed",
                     log_file=str(log_path),
                     generation_dump="",
+                    readable_dump="",
                     error=str(exc),
                 )
             )
 
+    new_rows = [asdict(r) for r in results]
+
     csv_path = run_dir / "summary.csv"
+    existing_fieldnames, existing_rows = load_summary_rows(csv_path)
+    merged_rows = merge_existing_and_new_rows(existing_rows, new_rows)
+
+    fieldnames = list(existing_fieldnames)
+    if not fieldnames and len(new_rows) > 0:
+        fieldnames = list(new_rows[0].keys())
+    for row in new_rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+
     with csv_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(asdict(results[0]).keys()))
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for row in results:
-            writer.writerow(asdict(row))
+        for row in merged_rows:
+            out_row = {k: row.get(k, "") for k in fieldnames}
+            writer.writerow(out_row)
 
     json_path = run_dir / "summary.json"
-    json_path.write_text(json.dumps([asdict(r) for r in results], indent=2))
+    json_path.write_text(json.dumps(merged_rows, indent=2))
 
     md_lines = [
         "# Checkpoint Validation Report",
@@ -649,14 +995,24 @@ def main() -> int:
         f"- Sample seed: {args.sample_seed}",
         f"- Subset parquet: {subset_path}",
         "",
-        "| Name | Profile | Mean Reward | Accuracy | Records | Status | Seconds |",
-        "|---|---|---:|---:|---:|---|---:|",
+        "| Name | Profile | Mean Reward | Accuracy | Resp Len (C) | Resp Len (I) | Reason Len (C) | Reason Len (I) | Records | Status | Seconds |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
 
-    for row in results:
+    for row in merged_rows:
+        mean_reward = _to_float(row.get("mean_reward"))
+        accuracy = _to_float(row.get("accuracy"))
+        resp_len_correct = _to_float(row.get("mean_response_length_correct"))
+        resp_len_incorrect = _to_float(row.get("mean_response_length_incorrect"))
+        reason_len_correct = _to_float(row.get("mean_reasoning_length_correct"))
+        reason_len_incorrect = _to_float(row.get("mean_reasoning_length_incorrect"))
+        num_records = _to_int(row.get("num_records"))
+        duration_sec = _to_float(row.get("duration_sec"))
         md_lines.append(
-            f"| {row.name} | {row.profile} | {markdown_float(row.mean_reward)} | {markdown_float(row.accuracy)} "
-            + f"| {row.num_records} | {row.status} | {row.duration_sec:.1f} |"
+            f"| {row.get('name', '')} | {row.get('profile', '')} | {markdown_float(mean_reward)} | {markdown_float(accuracy)} "
+            + f"| {markdown_float(resp_len_correct)} | {markdown_float(resp_len_incorrect)} "
+            + f"| {markdown_float(reason_len_correct)} | {markdown_float(reason_len_incorrect)} "
+            + f"| {num_records if num_records is not None else 'N/A'} | {row.get('status', '')} | {markdown_float(duration_sec)} |"
         )
 
     md_lines.append("")
@@ -667,13 +1023,13 @@ def main() -> int:
     md_lines.append(f"- Logs directory: {logs_dir}")
     md_lines.append(f"- Validation dumps: {validation_dump_dir}")
 
-    failures = [row for row in results if row.status != "ok"]
+    failures = [row for row in merged_rows if str(row.get("status", "")) != "ok"]
     if failures:
         md_lines.append("")
         md_lines.append("## Failures")
         md_lines.append("")
         for row in failures:
-            md_lines.append(f"- {row.name}: {row.error}")
+            md_lines.append(f"- {row.get('name', '')}: {row.get('error', '')}")
 
     report_path = run_dir / "report.md"
     report_path.write_text("\n".join(md_lines) + "\n")

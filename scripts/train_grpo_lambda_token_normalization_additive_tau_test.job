@@ -32,7 +32,7 @@ export N_GPUS=4
 export ROLLOUT_TP_SIZE=1
 export DATA_DIR=$PWD
 export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-export EXPERIMENT_NAME=test_grpo_lambda_token_norm_additive_tau_0p02
+export EXPERIMENT_NAME=test_grpo_lambda_token_norm_additive_tau
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \

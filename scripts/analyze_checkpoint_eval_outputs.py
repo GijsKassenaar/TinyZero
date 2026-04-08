@@ -92,14 +92,7 @@ def load_summary_rows(summary_csv: Path) -> list[dict[str, Any]]:
 
 
 def enrich_from_readable_dump(row: dict[str, Any], max_response_length: int) -> None:
-    readable_dump = row.get("readable_dump", "") or ""
-    if readable_dump == "":
-        generation_dump = row.get("generation_dump", "") or ""
-        if generation_dump.endswith(".jsonl"):
-            readable_dump = generation_dump[:-6] + ".readable.jsonl"
-
-    dump_path = Path(readable_dump)
-    if not dump_path.exists():
+    def mark_missing() -> None:
         row["n_correct"] = None
         row["n_incorrect"] = None
         row["mean_response_length_all"] = None
@@ -108,6 +101,23 @@ def enrich_from_readable_dump(row: dict[str, Any], max_response_length: int) -> 
         row["trunc_rate_incorrect"] = None
         row["trunc_rate_correct"] = None
         row["mean_reasoning_fraction_all"] = None
+
+    readable_dump = row.get("readable_dump", "") or ""
+    if readable_dump == "":
+        generation_dump = row.get("generation_dump", "") or ""
+        if generation_dump.endswith(".jsonl"):
+            readable_dump = generation_dump[:-6] + ".readable.jsonl"
+        else:
+            mark_missing()
+            return
+
+    if str(readable_dump).strip() == "":
+        mark_missing()
+        return
+
+    dump_path = Path(readable_dump)
+    if not dump_path.exists() or dump_path.is_dir() or not dump_path.is_file():
+        mark_missing()
         return
 
     n_correct = 0

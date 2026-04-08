@@ -3,18 +3,20 @@
 - Run dir: /gpfs/home1/gkassenaar/TinyZero/reports/checkpoint_eval/checkpoint_eval_20260401_153904
 - Baseline: test_normalphased
 - Max response length threshold: 2048
-- Generated: 2026-04-01T17:18:55
+- Generated: 2026-04-04T18:15:24
 
 ## Top Model
 
-- Name: test_normalphased
-- Mean reward: 0.8000
-- Accuracy: 0.8000
+- Name: grpo_lambda_0.99_seq-mean-token-mean
+- Mean reward: 0.9000
+- Accuracy: 0.9000
 
 ## Model Comparison
 
 | Model | Reward | Acc | dReward vs Base | dAcc vs Base | RespLen-C | RespLen-I | ReasonLen-C | ReasonLen-I | Trunc-I | MeanRespAll | MeanReasonAll |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| grpo_lambda_0.99_seq-mean-token-mean | 0.9000 | 0.9000 | 0.1000 | 0.1000 | 230.0556 | 2048.0000 | 209.5000 | 2048.0000 | 1.0000 | 411.8500 | 393.3500 |
+| test_grpo_lambda_0.99_reasoning_only | 0.8500 | 0.8500 | 0.0500 | 0.0500 | 467.1765 | 2048.0000 | 108.7059 | 738.6667 | 1.0000 | 704.3000 | 203.2000 |
 | test_normalphased | 0.8000 | 0.8000 | 0.0000 | 0.0000 | 342.2500 | 2048.0000 | 322.1875 | 0.0000 | 1.0000 | 683.4000 | 257.7500 |
 | test_grpo_lambda_0.99 | 0.8000 | 0.8000 | 0.0000 | 0.0000 | 272.5000 | 2048.0000 | 253.0625 | 0.0000 | 1.0000 | 627.6000 | 202.4500 |
 | test_grpo_lambda_0.999_token_normalization | 0.8000 | 0.8000 | 0.0000 | 0.0000 | 106.1875 | 2048.0000 | 87.0000 | 0.0000 | 1.0000 | 494.5500 | 69.6000 |

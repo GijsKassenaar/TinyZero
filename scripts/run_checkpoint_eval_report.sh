@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Wrapper for scripts/eval_checkpoint_report.py
 #
-# Defaults evaluate the built-in six checkpoints sequentially via
+# Defaults evaluate the built-in checkpoint set sequentially via
 # trainer val-only validation, using a 20-row subset from the test split.
 #
 # Example:
