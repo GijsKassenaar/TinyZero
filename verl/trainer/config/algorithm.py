@@ -122,6 +122,10 @@ class GRPOLambdaVariantConfig(BaseConfig):
         second_trace_after_token_norm_enable (bool): If True, apply an additional positional
             trace weighting after token normalization.
         second_trace_alpha (float): Exponent used by second positional trace weighting.
+        group_shortest_lambda_enable (bool): If True, compute one shared effective trace base per group
+            from shortest valid response length and ``group_shortest_lambda_alpha``.
+        group_shortest_lambda_alpha (float): Target first-token trace weight for the shortest response
+            in each group. Must be in (0, 1].
         correctness_threshold (float): Threshold used to infer correctness from sequence reward.
     """
 
@@ -135,6 +139,8 @@ class GRPOLambdaVariantConfig(BaseConfig):
     additive_normalization_tau: float = 0.02
     second_trace_after_token_norm_enable: bool = False
     second_trace_alpha: float = 1.0
+    group_shortest_lambda_enable: bool = False
+    group_shortest_lambda_alpha: float = 0.25
     correctness_threshold: float = 0.5
 
 
@@ -582,6 +588,9 @@ class AlgoConfig(BaseConfig):
         adv_estimator (str): Advantage estimator type: "gae", "grpo", "grpo_lambda",
             "reinforce_plus_plus", etc.
         norm_adv_by_std_in_grpo (bool): Whether to normalize advantages by std (specific to GRPO).
+        grpo_additive_normalization_enable (bool): If True and std normalization is enabled for plain GRPO,
+            divide by (std + tau) instead of (std + epsilon).
+        grpo_additive_normalization_tau (float): Tau offset used by plain GRPO additive denominator.
         use_kl_in_reward (bool): Whether to enable in-reward KL penalty.
         kl_penalty (str): How to estimate KL divergence: "kl", "abs", "mse", "low_var_kl", or "full".
         kl_ctrl (KLControlConfig): KL control configuration.
@@ -612,6 +621,8 @@ class AlgoConfig(BaseConfig):
     lam: float = 1.0
     adv_estimator: str = "gae"
     norm_adv_by_std_in_grpo: bool = True
+    grpo_additive_normalization_enable: bool = False
+    grpo_additive_normalization_tau: float = 0.02
     use_kl_in_reward: bool = False
     kl_penalty: str = "kl"
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)

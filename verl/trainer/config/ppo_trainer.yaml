@@ -83,6 +83,12 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
+  # Optional additive denominator for plain GRPO std normalization: centered / (std + tau)
+  grpo_additive_normalization_enable: False
+
+  # Tau used when grpo_additive_normalization_enable=True
+  grpo_additive_normalization_tau: 0.02
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
@@ -186,6 +192,13 @@ algorithm:
 
     # Strength for Idea 4 weighting as decay_trace^alpha
     second_trace_alpha: 1.0
+
+    # Idea 5: use one group-shared trace base computed from shortest valid response length
+    # and alpha (all samples share same decay shape; longer samples only extend further)
+    group_shortest_lambda_enable: False
+
+    # Target first-token trace weight for shortest response in group (0 < alpha <= 1)
+    group_shortest_lambda_alpha: 0.25
 
     # Fallback threshold to infer correctness from sequence score
     correctness_threshold: 0.5

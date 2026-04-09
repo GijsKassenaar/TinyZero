@@ -311,6 +311,12 @@ def compute_grpo_outcome_advantage(
 
     lead_cfg = config.get("lead") if config is not None else None
     use_lead = lead_cfg is not None and bool(lead_cfg.get("enable", False))
+    grpo_additive_normalization_enable = (
+        bool(config.get("grpo_additive_normalization_enable", False)) if config is not None else False
+    )
+    grpo_additive_normalization_tau = (
+        float(config.get("grpo_additive_normalization_tau", 0.02)) if config is not None else 0.02
+    )
 
     with torch.no_grad():
         bsz = scores.shape[0]
@@ -374,7 +380,12 @@ def compute_grpo_outcome_advantage(
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
             if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                if grpo_additive_normalization_enable:
+                    tau = max(float(grpo_additive_normalization_tau), float(epsilon))
+                    denom_offset = tau
+                else:
+                    denom_offset = float(epsilon)
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + denom_offset)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
             if use_lead:
@@ -450,6 +461,8 @@ def compute_grpo_lambda_advantages(
     additive_normalization_tau: float = 0.02,
     second_trace_after_token_norm_enable: bool = False,
     second_trace_alpha: float = 1.0,
+    group_shortest_lambda_enable: bool = False,
+    group_shortest_lambda_alpha: float = 0.25,
     is_correct: Optional[torch.Tensor] = None,
     reasoning_token_mask: Optional[torch.Tensor] = None,
     reasoning_only_discount_trace_enable: bool = False,
@@ -512,8 +525,22 @@ def compute_grpo_lambda_advantages(
     exponents = (valid_token_lengths_3d - 1.0 - token_positions).clamp(min=0.0)
     exponents = exponents * trace_mask
 
-    decay_base = rewards.new_tensor(gamma * lam)
-    decay_trace = torch.pow(decay_base, exponents)
+    if group_shortest_lambda_enable:
+        # One shared decay base per group, calibrated from shortest valid response length.
+        # All samples then share the same end-aligned trace shape.
+        alpha = min(max(float(group_shortest_lambda_alpha), float(epsilon)), 1.0)
+        inf_lengths = torch.full_like(valid_token_lengths, float("inf"))
+        valid_lengths_only = torch.where(group_valid > 0.0, valid_token_lengths, inf_lengths)
+        shortest_lengths = valid_lengths_only.min(dim=1).values
+        shortest_lengths = torch.where(torch.isfinite(shortest_lengths), shortest_lengths, torch.ones_like(shortest_lengths))
+
+        shortest_minus_one = (shortest_lengths - 1.0).clamp(min=1.0)
+        shared_decay_base = torch.pow(rewards.new_tensor(alpha), 1.0 / shortest_minus_one).view(-1, 1, 1)
+        decay_trace = torch.pow(shared_decay_base, exponents)
+    else:
+        decay_base = rewards.new_tensor(gamma * lam)
+        decay_trace = torch.pow(decay_base, exponents)
+
     if reasoning_only_discount_trace_enable:
         decay_trace = trace_mask * decay_trace + (1.0 - trace_mask)
 
@@ -619,6 +646,12 @@ def compute_grpo_lambda_outcome_advantage(
             bool(variant_cfg.get("second_trace_after_token_norm_enable", False)) if variant_enabled else False
         )
         second_trace_alpha = float(variant_cfg.get("second_trace_alpha", 1.0)) if variant_enabled else 1.0
+        group_shortest_lambda_enable = (
+            bool(variant_cfg.get("group_shortest_lambda_enable", False)) if variant_enabled else False
+        )
+        group_shortest_lambda_alpha = (
+            float(variant_cfg.get("group_shortest_lambda_alpha", 0.25)) if variant_enabled else 0.25
+        )
         correctness_threshold = float(variant_cfg.get("correctness_threshold", 0.5)) if variant_cfg is not None else 0.5
 
         bsz, seq_len = token_level_rewards.shape
@@ -673,6 +706,8 @@ def compute_grpo_lambda_outcome_advantage(
             additive_normalization_tau=additive_normalization_tau,
             second_trace_after_token_norm_enable=second_trace_after_token_norm_enable,
             second_trace_alpha=second_trace_alpha,
+            group_shortest_lambda_enable=group_shortest_lambda_enable,
+            group_shortest_lambda_alpha=group_shortest_lambda_alpha,
             is_correct=grouped_is_correct,
             reasoning_token_mask=grouped_reasoning_mask,
             reasoning_only_discount_trace_enable=reasoning_only_discount_trace_enable,

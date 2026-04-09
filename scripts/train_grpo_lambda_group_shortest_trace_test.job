@@ -1,8 +1,8 @@
 #!/bin/bash
-# Test job based on the GRPO-lambda test setup, but using discounted reasoning
-# over tokens inside think tags instead of lambda traces.
+# Test job: GRPO-lambda with group-shared shortest-anchored trace base.
+# Effective trace base is computed per group from shortest response length and alpha.
 
-#SBATCH --job-name=tinyzero_discounted_reasoning
+#SBATCH --job-name=tinyzero_grpo_lambda_group_shortest
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
@@ -33,7 +33,7 @@ export N_GPUS=4
 export ROLLOUT_TP_SIZE=1
 export DATA_DIR=$PWD
 export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-export EXPERIMENT_NAME=test_gamma_0.999_seq-mean-token-mean
+export EXPERIMENT_NAME=test_grpo_lambda_group_shortest_alpha
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
@@ -47,21 +47,26 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.policy_loss.loss_mode=grpo_lambda \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size=8 \
-    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
     actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
-    algorithm.adv_estimator=grpo \
-    algorithm.use_kl_in_reward=False \
+    critic.enable=False \
+    algorithm.adv_estimator=grpo_lambda \
+    algorithm.gamma=1.0 \
+    algorithm.lam=0.99 \
     algorithm.norm_adv_by_std_in_grpo=True \
+    algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.001 \
-    algorithm.discounted_reasoning.enable=True \
-    algorithm.discounted_reasoning.gamma=0.999 \
+    algorithm.grpo_lambda_variant.enable=True \
+    algorithm.grpo_lambda_variant.group_shortest_lambda_enable=True \
+    algorithm.grpo_lambda_variant.group_shortest_lambda_alpha=0.15 \
+    algorithm.grpo_lambda_variant.reasoning_only_discount_trace_enable=False \
     agent.entropy_logging.enable=False \
     agent.adaptive_window.enable=True \
     agent.adaptive_window.mode=phased \
@@ -70,7 +75,7 @@ python3 -m verl.trainer.main_ppo \
     agent.adaptive_window.phased_schedule='[[50,2048]]' \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.resume_mode=disable \
+    trainer.resume_mode=auto \
     trainer.total_training_steps=75 \
     trainer.save_freq=75 \
     trainer.test_freq=15 \
@@ -79,4 +84,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name=TinyZero \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.default_local_dir=$EXPERIMENT_NAME \
-    2>&1 | tee verl_gamma_test.log
+    2>&1 | tee verl_grpo_lambda_group_shortest_trace_test.log

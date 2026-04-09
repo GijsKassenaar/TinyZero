@@ -313,6 +313,12 @@ def compute_advantage(
                     variant_enabled and bool(variant_cfg.get("second_trace_after_token_norm_enable", False))
                 ),
                 "grpo_lambda_variant/second_trace_alpha": float(variant_cfg.get("second_trace_alpha", 1.0)),
+                "grpo_lambda_variant/group_shortest_lambda_enabled": float(
+                    variant_enabled and bool(variant_cfg.get("group_shortest_lambda_enable", False))
+                ),
+                "grpo_lambda_variant/group_shortest_lambda_alpha": float(
+                    variant_cfg.get("group_shortest_lambda_alpha", 0.25)
+                ),
                 "grpo_lambda_variant/sequence_discount_gamma": float(
                     variant_cfg.get("sequence_discount_gamma", 0.99999)
                 ),
@@ -961,6 +967,11 @@ class RayPPOTrainer:
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
+        correctness_threshold = 0.5
+        lead_cfg = self.config.algorithm.get("lead") if self.config.algorithm is not None else None
+        if lead_cfg is not None:
+            correctness_threshold = float(lead_cfg.get("correctness_threshold", correctness_threshold))
+
         # Lists to collect samples for the table
         sample_inputs = []
         sample_outputs = []
@@ -968,6 +979,9 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_response_lengths = []
+        sample_reasoning_lengths = []
+        sample_is_correct = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -1040,8 +1054,32 @@ class RayPPOTrainer:
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
+            _, reasoning_lengths_tensor, _, valid_response_lengths = compute_reasoning_token_statistics(
+                batch=test_batch,
+                tokenizer=self.tokenizer,
+            )
+            sample_response_lengths.extend(valid_response_lengths.float().cpu().tolist())
+            sample_reasoning_lengths.extend(reasoning_lengths_tensor.float().cpu().tolist())
+
             reward_extra_infos_dict["reward"].extend(scores)
             reward_extra_info = result.get("reward_extra_info", {})
+
+            batch_acc_values = reward_extra_info.get("acc", None)
+            if batch_acc_values is None:
+                batch_is_correct = [1.0 if score > correctness_threshold else 0.0 for score in scores]
+            elif isinstance(batch_acc_values, np.ndarray):
+                batch_is_correct = np.asarray(batch_acc_values, dtype=np.float32).reshape(-1).tolist()
+            elif torch.is_tensor(batch_acc_values):
+                batch_is_correct = batch_acc_values.detach().float().cpu().reshape(-1).tolist()
+            elif isinstance(batch_acc_values, list):
+                batch_is_correct = [float(v) for v in batch_acc_values]
+            else:
+                batch_is_correct = [float(batch_acc_values)]
+
+            if len(batch_is_correct) != len(scores):
+                batch_is_correct = [1.0 if score > correctness_threshold else 0.0 for score in scores]
+            sample_is_correct.extend(batch_is_correct)
+
             for key, values in reward_extra_info.items():
                 if key not in reward_extra_infos_dict:
                     reward_extra_infos_dict[key] = []
@@ -1098,6 +1136,22 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        if len(sample_response_lengths) > 0 and len(sample_reasoning_lengths) > 0 and len(sample_is_correct) > 0:
+            n = min(len(sample_response_lengths), len(sample_reasoning_lengths), len(sample_is_correct))
+            response_lengths_arr = np.asarray(sample_response_lengths[:n], dtype=np.float32)
+            reasoning_lengths_arr = np.asarray(sample_reasoning_lengths[:n], dtype=np.float32)
+            correct_mask = np.asarray(sample_is_correct[:n], dtype=np.float32) > 0.5
+
+            metric_dict["val-aux/response_length/mean"] = float(response_lengths_arr.mean())
+            metric_dict["val-aux/reasoning_length/mean"] = float(reasoning_lengths_arr.mean())
+
+            if np.any(correct_mask):
+                metric_dict["val-aux/response_length/mean_correct"] = float(response_lengths_arr[correct_mask].mean())
+                metric_dict["val-aux/reasoning_length/mean_correct"] = float(reasoning_lengths_arr[correct_mask].mean())
+            else:
+                metric_dict["val-aux/response_length/mean_correct"] = 0.0
+                metric_dict["val-aux/reasoning_length/mean_correct"] = 0.0
 
         return metric_dict
 
