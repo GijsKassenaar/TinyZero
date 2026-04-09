@@ -113,6 +113,22 @@ r_hat_i  = sequence-level normalized outcome
 A_i,t    = r_hat_i * w_i,t
 ```
 
+### Exact Variant You Requested: Group-Shared Shortest-Anchored Trace
+
+All samples in a group share the same exponential base, calibrated from the shortest rollout.
+Longer rollouts simply continue that same trace for extra early tokens.
+
+```text
+lambda_eff = clip(alpha^(1 / max(T_min - 1, 1)) / gamma, lambda_min, lambda_max)
+base       = gamma * lambda_eff
+w_i,t      = base^(T_i - 1 - t)
+A_i,t      = r_hat_i * w_i,t
+```
+
+Key property:
+- For any two samples i and j, when aligned by distance-to-end d, they have identical weights: w_i(d) = w_j(d).
+- Only longer samples have additional prefix tokens with d > T_min - 1.
+
 Anchor requirement:
 
 ```text
