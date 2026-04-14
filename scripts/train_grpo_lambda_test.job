@@ -75,6 +75,7 @@ python3 -m verl.trainer.main_ppo \
     agent.adaptive_window.phased_schedule='[[50,2048]]' \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
+    trainer.resume_mode=resume_path \
     trainer.resume_from_path=$RESUME_FROM_PATH \
     trainer.total_training_steps=1 \
     trainer.save_freq=75 \

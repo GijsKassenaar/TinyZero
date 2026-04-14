@@ -33,7 +33,11 @@ export N_GPUS=4
 export ROLLOUT_TP_SIZE=1
 export DATA_DIR=$PWD
 export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-export EXPERIMENT_NAME=test_gamma_0.999_additive_tau_incorrect_penalty
+
+# Resume the existing tau=0.07 run from global_step_30 and continue to step 75.
+TAU=0.07
+TAU_TAG="${TAU//./p}"
+export EXPERIMENT_NAME="test_gamma_0.999_addtau_${TAU_TAG}_incorrect_penalty_30steps"
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
@@ -59,8 +63,8 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=True \
     algorithm.grpo_additive_normalization_enable=True \
-    algorithm.grpo_additive_normalization_tau=0.02 \
-    algorithm.incorrect_answer_penalty.enable=True \
+    algorithm.grpo_additive_normalization_tau=$TAU \
+    algorithm.incorrect_answer_penalty.enable=False \
     algorithm.incorrect_answer_penalty.penalty=-1.0 \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.001 \
@@ -83,4 +87,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name=TinyZero \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.default_local_dir=$EXPERIMENT_NAME \
-    2>&1 | tee verl_gamma_grpo_test.log
+    2>&1 | tee "verl_gamma_grpo_tau_${TAU_TAG}_resume_to_75.log"
