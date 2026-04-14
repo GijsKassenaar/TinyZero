@@ -23,6 +23,7 @@ __all__ = [
     "FilterGroupsConfig",
     "GRPOLambdaVariantConfig",
     "HybridBranchConfig",
+    "IncorrectAnswerPenaltyConfig",
     "KLControlConfig",
     "LeadConfig",
     "RolloutCorrectionConfig",
@@ -67,27 +68,38 @@ class FilterGroupsConfig(BaseConfig):
 
 
 @dataclass
+class IncorrectAnswerPenaltyConfig(BaseConfig):
+    """Configuration for globally penalizing incorrect answers.
+
+    Args:
+        enable (bool): Whether to replace incorrect sequence rewards with a fixed penalty.
+        penalty (float): Sequence reward assigned to incorrect answers when enabled.
+    """
+
+    enable: bool = False
+    penalty: float = -1.0
+
+
+@dataclass
 class LeadConfig(BaseConfig):
     """Configuration for LEAD-style GRPO modifications.
 
     Args:
         enable (bool): Whether to enable LEAD shaping in GRPO advantage computation.
         alpha (float): Length z-score decay coefficient in exp(-alpha * z).
-        incorrect_penalty (float): Sequence reward assigned to incorrect answers.
         tau (float): Target group accuracy for difficulty-aware weighting.
         beta (float): Width of Gaussian difficulty-aware weighting.
         epsilon (float): Numerical stability term for z-score and normalization.
-        correctness_threshold (float): Threshold to infer correctness from sequence reward when no explicit
-            `acc` field is available.
+
+    Note:
+        LEAD always uses ``algorithm.incorrect_answer_penalty.penalty`` for incorrect samples.
     """
 
     enable: bool = False
     alpha: float = 0.1
-    incorrect_penalty: float = -1.0
     tau: float = 0.5
     beta: float = 0.2
     epsilon: float = 1e-6
-    correctness_threshold: float = 0.5
 
 
 @dataclass
@@ -597,6 +609,7 @@ class AlgoConfig(BaseConfig):
         use_pf_ppo (bool): Whether to enable preference feedback PPO.
         pf_ppo (dict[str, Any]): Preference feedback PPO settings.
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
+        incorrect_answer_penalty (Optional[IncorrectAnswerPenaltyConfig]): Global incorrect-answer penalty.
         discounted_reasoning (Optional[DiscountedReasoningConfig]): Exponential discount over reasoning tokens.
         grpo_lambda_variant (Optional[GRPOLambdaVariantConfig]): GRPO-lambda variant controls.
         sgrpo (Optional[SGRPOConfig]): S-GRPO two-phase serial-group generation settings.
@@ -629,6 +642,7 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    incorrect_answer_penalty: Optional[IncorrectAnswerPenaltyConfig] = None
     lead: Optional[LeadConfig] = None
     discounted_reasoning: Optional[DiscountedReasoningConfig] = None
     grpo_lambda_variant: Optional[GRPOLambdaVariantConfig] = None

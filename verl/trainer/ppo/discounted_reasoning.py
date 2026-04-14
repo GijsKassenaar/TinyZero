@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import re
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -94,42 +94,49 @@ def compute_reasoning_token_statistics(
     return reasoning_mask, reasoning_lengths, closed_think, valid_response_lengths
 
 
-def apply_reasoning_reward_discount(
-    batch: DataProto,
-    reward_tensor: torch.Tensor,
-    tokenizer: Any,
-    discount_cfg: Any,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    """Apply exponential discount gamma^K where K is reasoning tokens inside think tags."""
-    gamma = float(discount_cfg.get("gamma", 1.0))
+def compute_reasoning_discount_metrics(
+    reasoning_lengths_tensor: torch.Tensor,
+    closed_think_tensor: torch.Tensor,
+    valid_response_lengths: torch.Tensor,
+    gamma: float,
+    is_correct: Optional[torch.Tensor] = None,
+) -> dict[str, float]:
+    """Compute discounted-reasoning metrics for the currently discounted sample subset.
+
+    When ``is_correct`` is provided, metrics are computed only on correct responses,
+    matching the discount application in core algorithms.
+    """
+    gamma = float(gamma)
     if gamma <= 0.0 or gamma > 1.0:
         raise ValueError(f"discounted_reasoning.gamma must satisfy 0 < gamma <= 1, got {gamma}")
 
-    _, reasoning_lengths_tensor, closed_think_tensor, valid_response_lengths = compute_reasoning_token_statistics(
-        batch=batch,
-        tokenizer=tokenizer,
-    )
-    reasoning_lengths_tensor = reasoning_lengths_tensor.to(device=reward_tensor.device, dtype=torch.float32)
-    closed_think_tensor = closed_think_tensor.to(device=reward_tensor.device, dtype=torch.bool)
-    valid_response_lengths = valid_response_lengths.to(device=reward_tensor.device, dtype=torch.long)
+    reasoning_lengths_tensor = reasoning_lengths_tensor.to(dtype=torch.float32)
+    closed_think_tensor = closed_think_tensor.to(dtype=torch.bool)
+    valid_response_lengths = valid_response_lengths.to(dtype=torch.long)
+
     valid_reasoning_mask = (valid_response_lengths > 0) & closed_think_tensor
+    if is_correct is not None:
+        correct_mask = is_correct.to(dtype=torch.float32).reshape(-1) > 0.5
+        if correct_mask.numel() == valid_reasoning_mask.numel():
+            valid_reasoning_mask = valid_reasoning_mask & correct_mask
+
     discount_factors = torch.pow(
         torch.full_like(reasoning_lengths_tensor, gamma, dtype=torch.float32),
         reasoning_lengths_tensor,
     )
 
-    discounted_reward_tensor = reward_tensor * discount_factors.unsqueeze(-1)
-
     if valid_reasoning_mask.any():
         mean_reasoning_tokens = float(reasoning_lengths_tensor[valid_reasoning_mask].mean().item())
         mean_discount_factor = float(discount_factors[valid_reasoning_mask].mean().item())
+        num_discounted_samples = float(valid_reasoning_mask.sum().item())
     else:
         mean_reasoning_tokens = 0.0
         mean_discount_factor = 0.0
+        num_discounted_samples = 0.0
 
-    metrics = {
+    return {
         "discounted_reasoning/gamma": gamma,
         "discounted_reasoning/mean_reasoning_tokens": mean_reasoning_tokens,
         "discounted_reasoning/mean_discount_factor": mean_discount_factor,
+        "discounted_reasoning/num_discounted_samples": num_discounted_samples,
     }
-    return discounted_reward_tensor, metrics

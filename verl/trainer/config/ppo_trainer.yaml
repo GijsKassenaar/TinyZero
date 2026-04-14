@@ -89,6 +89,15 @@ algorithm:
   # Tau used when grpo_additive_normalization_enable=True
   grpo_additive_normalization_tau: 0.02
 
+  # Global incorrect-answer penalty usable across all estimators/scripts
+  incorrect_answer_penalty:
+
+    # Enable replacing incorrect sequence rewards with a fixed penalty
+    enable: False
+
+    # Penalty applied to incorrect sequence rewards when enabled
+    penalty: -1.0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
@@ -134,9 +143,6 @@ algorithm:
     # Length z-score decay coefficient for correct answers
     alpha: 0.1
 
-    # Fixed reward assigned to incorrect answers
-    incorrect_penalty: -1.0
-
     # Target group accuracy for difficulty-aware weighting
     tau: 0.5
 
@@ -145,9 +151,6 @@ algorithm:
 
     # Numerical stability epsilon used in LEAD computations
     epsilon: 1e-6
-
-    # Fallback threshold to infer correctness from sequence score
-    correctness_threshold: 0.5
 
   # Exponential reward discounting over reasoning tokens inside think tags
   discounted_reasoning:

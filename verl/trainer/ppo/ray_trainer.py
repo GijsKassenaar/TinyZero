@@ -44,7 +44,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.adaptive_window import AdaptiveSuccessWindowConfig, AdaptiveSuccessWindowController
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
-from verl.trainer.ppo.discounted_reasoning import apply_reasoning_reward_discount, compute_reasoning_token_statistics
+from verl.trainer.ppo.discounted_reasoning import compute_reasoning_discount_metrics, compute_reasoning_token_statistics
 from verl.trainer.ppo.metric_utils import (
     compute_completion_metrics,
     compute_data_metrics,
@@ -146,7 +146,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
             - A dictionary of metrics related to the KL penalty
     """
     response_mask = data.batch["response_mask"]
-    token_level_scores = data.batch.get("token_level_scores_for_reward", data.batch["token_level_scores"])
+    token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
 
     # compute kl between ref_policy and current policy
@@ -242,15 +242,29 @@ def compute_advantage(
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
         sequence_scores = data.batch["token_level_rewards"].sum(dim=-1)
-        lead_cfg = config.get("lead") if config is not None else None
-        correctness_threshold = 0.5
-        if lead_cfg is not None:
-            correctness_threshold = float(lead_cfg.get("correctness_threshold", correctness_threshold))
-
         if "acc" in data.non_tensor_batch:
             is_correct = torch.as_tensor(data.non_tensor_batch["acc"], device=sequence_scores.device, dtype=torch.float32)
         else:
-            is_correct = (sequence_scores > correctness_threshold).to(dtype=torch.float32)
+            is_correct = (sequence_scores > 0.5).to(dtype=torch.float32)
+
+        reasoning_lengths = None
+        reasoning_discount_gamma = None
+        reasoning_discount_metrics = None
+        discounted_reasoning_cfg = config.get("discounted_reasoning") if config is not None else None
+        if discounted_reasoning_cfg is not None and bool(discounted_reasoning_cfg.get("enable", False)):
+            if tokenizer is None:
+                raise ValueError("Tokenizer is required when algorithm.discounted_reasoning.enable=True")
+            _, reasoning_lengths, closed_think_tensor, valid_response_lengths = compute_reasoning_token_statistics(
+                data, tokenizer
+            )
+            reasoning_discount_gamma = float(discounted_reasoning_cfg.get("gamma", 1.0))
+            reasoning_discount_metrics = compute_reasoning_discount_metrics(
+                reasoning_lengths_tensor=reasoning_lengths,
+                closed_think_tensor=closed_think_tensor,
+                valid_response_lengths=valid_response_lengths,
+                gamma=reasoning_discount_gamma,
+                is_correct=is_correct,
+            )
 
         response_lengths = grpo_calculation_mask.sum(dim=-1)
 
@@ -261,14 +275,49 @@ def compute_advantage(
             index=data.non_tensor_batch["uid"],
             is_correct=is_correct,
             response_lengths=response_lengths,
+            reasoning_lengths=reasoning_lengths,
+            reasoning_discount_gamma=reasoning_discount_gamma,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        if reasoning_discount_metrics is not None:
+            if data.meta_info is None:
+                data.meta_info = {}
+            data.meta_info["discounted_reasoning_metrics"] = reasoning_discount_metrics
     elif adv_estimator == AdvantageEstimator.GRPO_LAMBDA:
         # GRPO-λ: group-normalized outcome reward + backward eligibility trace on valid tokens.
         reasoning_token_mask = None
+        sequence_scores = data.batch["token_level_rewards"].sum(dim=-1)
+        if "acc" in data.non_tensor_batch:
+            is_correct = torch.as_tensor(data.non_tensor_batch["acc"], device=sequence_scores.device, dtype=torch.float32)
+        else:
+            is_correct = (sequence_scores > 0.5).to(dtype=torch.float32)
+
+        reasoning_discount_enable = False
+        reasoning_discount_gamma = 1.0
+        reasoning_discount_metrics = None
+        discounted_reasoning_cfg = config.get("discounted_reasoning") if config is not None else None
+        if discounted_reasoning_cfg is not None and bool(discounted_reasoning_cfg.get("enable", False)):
+            if tokenizer is None:
+                raise ValueError("Tokenizer is required when algorithm.discounted_reasoning.enable=True")
+            (
+                reasoning_token_mask,
+                reasoning_lengths,
+                closed_think_tensor,
+                valid_response_lengths,
+            ) = compute_reasoning_token_statistics(data, tokenizer)
+            reasoning_discount_enable = True
+            reasoning_discount_gamma = float(discounted_reasoning_cfg.get("gamma", 1.0))
+            reasoning_discount_metrics = compute_reasoning_discount_metrics(
+                reasoning_lengths_tensor=reasoning_lengths,
+                closed_think_tensor=closed_think_tensor,
+                valid_response_lengths=valid_response_lengths,
+                gamma=reasoning_discount_gamma,
+                is_correct=is_correct,
+            )
+
         variant_cfg = config.get("grpo_lambda_variant") if config is not None else None
         if variant_cfg is not None and bool(variant_cfg.get("enable", False)):
             reasoning_only_discount_trace_enable = bool(variant_cfg.get("reasoning_only_discount_trace_enable", False))
@@ -277,7 +326,8 @@ def compute_advantage(
                     raise ValueError(
                         "Tokenizer is required when grpo_lambda_variant.reasoning_only_discount_trace_enable=True"
                     )
-                reasoning_token_mask, _, _, _ = compute_reasoning_token_statistics(data, tokenizer)
+                if reasoning_token_mask is None:
+                    reasoning_token_mask, _, _, _ = compute_reasoning_token_statistics(data, tokenizer)
 
         advantages, returns = core_algos.compute_grpo_lambda_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -287,10 +337,17 @@ def compute_advantage(
             lam=lam,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
+            is_correct=is_correct,
             reasoning_token_mask=reasoning_token_mask,
+            reasoning_discount_enable=reasoning_discount_enable,
+            reasoning_discount_gamma=reasoning_discount_gamma,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        if reasoning_discount_metrics is not None:
+            if data.meta_info is None:
+                data.meta_info = {}
+            data.meta_info["discounted_reasoning_metrics"] = reasoning_discount_metrics
 
         if variant_cfg is not None:
             if data.meta_info is None:
@@ -406,6 +463,7 @@ def compute_hybrid_branch_advantages(
     lam: float,
     norm_adv_by_std_in_grpo: bool,
     config: AlgoConfig,
+    tokenizer: Any = None,
 ) -> DataProto:
     """Compute S-GRPO and GRPO advantages on their own branch subsets, then merge in-place."""
     if tag_key not in data.non_tensor_batch:
@@ -455,6 +513,7 @@ def compute_hybrid_branch_advantages(
             lam=lam,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
+            tokenizer=tokenizer,
         )
         grpo_mask = torch.from_numpy(grpo_mask_np).to(data.batch["token_level_rewards"].device)
         advantages[grpo_mask] = grpo_data.batch["advantages"]
@@ -968,9 +1027,6 @@ class RayPPOTrainer:
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
         correctness_threshold = 0.5
-        lead_cfg = self.config.algorithm.get("lead") if self.config.algorithm is not None else None
-        if lead_cfg is not None:
-            correctness_threshold = float(lead_cfg.get("correctness_threshold", correctness_threshold))
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -1900,8 +1956,6 @@ class RayPPOTrainer:
                                 batch = batch.union(reward_tensor)
 
                             # Compute or extract reward for training
-                            discounted_reward_tensor = None
-
                             if self.config.reward_model.launch_reward_fn_async:
                                 future_reward = compute_reward_async.remote(
                                     data=batch, config=self.config, tokenizer=self.tokenizer
@@ -1910,19 +1964,6 @@ class RayPPOTrainer:
                                 reward_tensor, reward_extra_infos_dict = self._compute_or_extract_reward(
                                     batch, reward_fn=self.reward_fn, return_dict=False
                                 )
-
-                                discounted_reasoning_cfg = self.config.algorithm.get("discounted_reasoning", None)
-                                if (
-                                    discounted_reasoning_cfg is not None
-                                    and discounted_reasoning_cfg.get("enable", False)
-                                ):
-                                    discounted_reward_tensor, discounted_reasoning_metrics = apply_reasoning_reward_discount(
-                                        batch=batch,
-                                        reward_tensor=reward_tensor,
-                                        tokenizer=self.tokenizer,
-                                        discount_cfg=discounted_reasoning_cfg,
-                                    )
-                                    metrics.update(discounted_reasoning_metrics)
 
                         # Operating Mode Selection:
                         # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1986,23 +2027,7 @@ class RayPPOTrainer:
                             reward_extra_infos_dict: dict[str, list]
                             if self.config.reward_model.launch_reward_fn_async:
                                 reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                                discounted_reasoning_cfg = self.config.algorithm.get("discounted_reasoning", None)
-                                if (
-                                    discounted_reasoning_cfg is not None
-                                    and discounted_reasoning_cfg.get("enable", False)
-                                ):
-                                    discounted_reward_tensor, discounted_reasoning_metrics = apply_reasoning_reward_discount(
-                                        batch=batch,
-                                        reward_tensor=reward_tensor,
-                                        tokenizer=self.tokenizer,
-                                        discount_cfg=discounted_reasoning_cfg,
-                                    )
-                                    metrics.update(discounted_reasoning_metrics)
                             batch.batch["token_level_scores"] = reward_tensor
-                            if discounted_reward_tensor is not None:
-                                batch.batch["token_level_scores_for_reward"] = discounted_reward_tensor
-                            elif "token_level_scores_for_reward" in batch.batch:
-                                batch.batch.pop("token_level_scores_for_reward")
 
                             if reward_extra_infos_dict:
                                 batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
@@ -2014,9 +2039,7 @@ class RayPPOTrainer:
                                 )
                                 metrics.update(kl_metrics)
                             else:
-                                batch.batch["token_level_rewards"] = batch.batch.get(
-                                    "token_level_scores_for_reward", batch.batch["token_level_scores"]
-                                )
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                             if self._adaptive_window is not None:
                                 aw_metrics = self._adaptive_window.update_from_batch(
@@ -2075,6 +2098,7 @@ class RayPPOTrainer:
                                     lam=self.config.algorithm.lam,
                                     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                                     config=self.config.algorithm,
+                                    tokenizer=self.tokenizer,
                                 )
                             else:
                                 batch = compute_advantage(
@@ -2091,6 +2115,10 @@ class RayPPOTrainer:
                             variant_metrics = batch.meta_info.pop("grpo_lambda_variant_metrics", None)
                             if variant_metrics:
                                 metrics.update(variant_metrics)
+
+                            discounted_reasoning_metrics = batch.meta_info.pop("discounted_reasoning_metrics", None)
+                            if discounted_reasoning_metrics:
+                                metrics.update(discounted_reasoning_metrics)
 
                         # update critic
                         if self.use_critic:

@@ -270,6 +270,8 @@ def compute_grpo_outcome_advantage(
     index: np.ndarray,
     is_correct: Optional[torch.Tensor] = None,
     response_lengths: Optional[torch.Tensor] = None,
+    reasoning_lengths: Optional[torch.Tensor] = None,
+    reasoning_discount_gamma: Optional[float] = None,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -311,6 +313,13 @@ def compute_grpo_outcome_advantage(
 
     lead_cfg = config.get("lead") if config is not None else None
     use_lead = lead_cfg is not None and bool(lead_cfg.get("enable", False))
+    incorrect_penalty_cfg = config.get("incorrect_answer_penalty") if config is not None else None
+    use_global_incorrect_penalty = (
+        incorrect_penalty_cfg is not None and bool(incorrect_penalty_cfg.get("enable", False))
+    )
+    global_incorrect_penalty = (
+        float(incorrect_penalty_cfg.get("penalty", -1.0)) if incorrect_penalty_cfg is not None else -1.0
+    )
     grpo_additive_normalization_enable = (
         bool(config.get("grpo_additive_normalization_enable", False)) if config is not None else False
     )
@@ -321,22 +330,24 @@ def compute_grpo_outcome_advantage(
     with torch.no_grad():
         bsz = scores.shape[0]
 
+        if is_correct is None:
+            is_correct = (scores > 0.5).to(dtype=scores.dtype)
+        else:
+            is_correct = is_correct.to(device=scores.device, dtype=scores.dtype)
+
+        if use_global_incorrect_penalty:
+            scores = torch.where(is_correct > 0.5, scores, torch.full_like(scores, global_incorrect_penalty))
+
         if use_lead:
             lead_alpha = float(lead_cfg.get("alpha", 0.1))
-            incorrect_penalty = float(lead_cfg.get("incorrect_penalty", -1.0))
+            incorrect_penalty = global_incorrect_penalty
             lead_tau = float(lead_cfg.get("tau", 0.5))
             lead_beta = float(lead_cfg.get("beta", 0.2))
             lead_epsilon = float(lead_cfg.get("epsilon", epsilon))
-            correctness_threshold = float(lead_cfg.get("correctness_threshold", 0.5))
 
             if response_lengths is None:
                 response_lengths = response_mask.sum(dim=-1)
             response_lengths = response_lengths.to(device=scores.device, dtype=scores.dtype)
-
-            if is_correct is None:
-                is_correct = (scores > correctness_threshold).to(dtype=scores.dtype)
-            else:
-                is_correct = is_correct.to(device=scores.device, dtype=scores.dtype)
 
             group_to_indices: dict[Any, list[int]] = defaultdict(list)
             for i in range(bsz):
@@ -365,6 +376,14 @@ def compute_grpo_outcome_advantage(
                 id2weight[group_id] = weight
 
             scores = shaped_scores
+
+        if reasoning_discount_gamma is not None and reasoning_lengths is not None:
+            gamma = float(reasoning_discount_gamma)
+            if gamma <= 0.0 or gamma > 1.0:
+                raise ValueError(f"discounted_reasoning.gamma must satisfy 0 < gamma <= 1, got {gamma}")
+            reasoning_lengths = reasoning_lengths.to(device=scores.device, dtype=scores.dtype)
+            discount_factors = torch.pow(torch.full_like(reasoning_lengths, gamma), reasoning_lengths)
+            scores = torch.where(is_correct > 0.5, scores * discount_factors, scores)
 
         for i in range(bsz):
             id2score[index[i]].append(scores[i])
@@ -456,6 +475,8 @@ def compute_grpo_lambda_advantages(
     flat_incorrect_trace: bool = False,
     sequence_gamma_discount_enable: bool = False,
     sequence_discount_gamma: float = 0.99999,
+    reasoning_discount_enable: bool = False,
+    reasoning_discount_gamma: float = 1.0,
     token_normalization_enable: bool = False,
     additive_normalization_enable: bool = False,
     additive_normalization_tau: float = 0.02,
@@ -463,6 +484,8 @@ def compute_grpo_lambda_advantages(
     second_trace_alpha: float = 1.0,
     group_shortest_lambda_enable: bool = False,
     group_shortest_lambda_alpha: float = 0.25,
+    incorrect_answer_penalty_enable: bool = False,
+    incorrect_answer_penalty: float = -1.0,
     is_correct: Optional[torch.Tensor] = None,
     reasoning_token_mask: Optional[torch.Tensor] = None,
     reasoning_only_discount_trace_enable: bool = False,
@@ -511,10 +534,43 @@ def compute_grpo_lambda_advantages(
     # Sequence-level outcomes per sample (batch, group).
     sequence_rewards = torch.sum(rewards * mask, dim=-1)
 
+    inferred_is_correct = is_correct
+    if inferred_is_correct is None:
+        inferred_is_correct = (sequence_rewards > 0.5).to(dtype=rewards.dtype)
+    else:
+        inferred_is_correct = inferred_is_correct.to(device=rewards.device, dtype=rewards.dtype)
+
+    if incorrect_answer_penalty_enable:
+        sequence_rewards = torch.where(
+            inferred_is_correct > 0.5,
+            sequence_rewards,
+            torch.full_like(sequence_rewards, float(incorrect_answer_penalty)),
+        )
+
     if sequence_gamma_discount_enable:
         discount_base = rewards.new_tensor(sequence_discount_gamma)
         discount_lengths = trace_token_lengths if reasoning_only_discount_trace_enable else valid_token_lengths
-        sequence_rewards = sequence_rewards * torch.pow(discount_base, discount_lengths)
+        sequence_discount_factors = torch.pow(discount_base, discount_lengths)
+        sequence_rewards = torch.where(
+            inferred_is_correct > 0.5,
+            sequence_rewards * sequence_discount_factors,
+            sequence_rewards,
+        )
+
+    if reasoning_discount_enable:
+        gamma_reasoning = float(reasoning_discount_gamma)
+        if gamma_reasoning <= 0.0 or gamma_reasoning > 1.0:
+            raise ValueError(f"discounted_reasoning.gamma must satisfy 0 < gamma <= 1, got {gamma_reasoning}")
+        if reasoning_token_mask is not None:
+            reasoning_lengths = reasoning_token_mask.to(dtype=rewards.dtype).sum(dim=-1)
+        else:
+            reasoning_lengths = torch.zeros_like(sequence_rewards)
+        reasoning_discount_factors = torch.pow(torch.full_like(reasoning_lengths, gamma_reasoning), reasoning_lengths)
+        sequence_rewards = torch.where(
+            inferred_is_correct > 0.5,
+            sequence_rewards * reasoning_discount_factors,
+            sequence_rewards,
+        )
 
     group_valid = (valid_token_lengths > 0).to(dtype=rewards.dtype)
     valid_group_count = group_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -545,9 +601,7 @@ def compute_grpo_lambda_advantages(
         decay_trace = trace_mask * decay_trace + (1.0 - trace_mask)
 
     if flat_incorrect_trace:
-        if is_correct is None:
-            raise ValueError("is_correct must be provided when flat_incorrect_trace=True")
-        correct_trace_mask = (is_correct > 0.5).to(dtype=rewards.dtype).unsqueeze(-1)
+        correct_trace_mask = (inferred_is_correct > 0.5).to(dtype=rewards.dtype).unsqueeze(-1)
         flat_trace = torch.ones_like(decay_trace)
         decay_trace = correct_trace_mask * decay_trace + (1.0 - correct_trace_mask) * flat_trace
 
@@ -602,7 +656,10 @@ def compute_grpo_lambda_outcome_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    is_correct: Optional[torch.Tensor] = None,
     reasoning_token_mask: Optional[torch.Tensor] = None,
+    reasoning_discount_enable: bool = False,
+    reasoning_discount_gamma: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute GRPO-λ token-level advantages for flattened grouped trajectories.
 
@@ -652,7 +709,14 @@ def compute_grpo_lambda_outcome_advantage(
         group_shortest_lambda_alpha = (
             float(variant_cfg.get("group_shortest_lambda_alpha", 0.25)) if variant_enabled else 0.25
         )
-        correctness_threshold = float(variant_cfg.get("correctness_threshold", 0.5)) if variant_cfg is not None else 0.5
+
+        incorrect_penalty_cfg = config.get("incorrect_answer_penalty") if config is not None else None
+        use_global_incorrect_penalty = (
+            incorrect_penalty_cfg is not None and bool(incorrect_penalty_cfg.get("enable", False))
+        )
+        global_incorrect_penalty = (
+            float(incorrect_penalty_cfg.get("penalty", -1.0)) if incorrect_penalty_cfg is not None else -1.0
+        )
 
         bsz, seq_len = token_level_rewards.shape
         grouped_indices: dict[Any, list[int]] = defaultdict(list)
@@ -674,7 +738,14 @@ def compute_grpo_lambda_outcome_advantage(
         sequence_rewards_flat = torch.sum(
             token_level_rewards * response_mask.to(dtype=token_level_rewards.dtype), dim=-1
         )
-        is_correct_flat = (sequence_rewards_flat > correctness_threshold).to(dtype=token_level_rewards.dtype)
+        if is_correct is None:
+            is_correct_flat = (sequence_rewards_flat > 0.5).to(dtype=token_level_rewards.dtype)
+        else:
+            is_correct_flat = is_correct.to(device=token_level_rewards.device, dtype=token_level_rewards.dtype)
+            if is_correct_flat.numel() != sequence_rewards_flat.numel():
+                is_correct_flat = (sequence_rewards_flat > 0.5).to(dtype=token_level_rewards.dtype)
+            else:
+                is_correct_flat = is_correct_flat.reshape_as(sequence_rewards_flat)
 
         group_keys = list(grouped_indices.keys())
         for group_pos, group_key in enumerate(group_keys):
@@ -701,6 +772,8 @@ def compute_grpo_lambda_outcome_advantage(
             flat_incorrect_trace=flat_incorrect_trace,
             sequence_gamma_discount_enable=sequence_gamma_discount_enable,
             sequence_discount_gamma=sequence_discount_gamma,
+            reasoning_discount_enable=reasoning_discount_enable,
+            reasoning_discount_gamma=reasoning_discount_gamma,
             token_normalization_enable=token_normalization_enable,
             additive_normalization_enable=additive_normalization_enable,
             additive_normalization_tau=additive_normalization_tau,
@@ -708,6 +781,8 @@ def compute_grpo_lambda_outcome_advantage(
             second_trace_alpha=second_trace_alpha,
             group_shortest_lambda_enable=group_shortest_lambda_enable,
             group_shortest_lambda_alpha=group_shortest_lambda_alpha,
+            incorrect_answer_penalty_enable=use_global_incorrect_penalty,
+            incorrect_answer_penalty=global_incorrect_penalty,
             is_correct=grouped_is_correct,
             reasoning_token_mask=grouped_reasoning_mask,
             reasoning_only_discount_trace_enable=reasoning_only_discount_trace_enable,

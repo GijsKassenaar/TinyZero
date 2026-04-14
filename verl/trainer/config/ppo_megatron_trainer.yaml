@@ -119,6 +119,9 @@ algorithm:
   norm_adv_by_std_in_grpo: True
   grpo_additive_normalization_enable: False
   grpo_additive_normalization_tau: 0.02
+  incorrect_answer_penalty:
+    enable: False
+    penalty: -1.0
   use_kl_in_reward: False
   kl_penalty: kl # how to estimate kl divergence
   kl_ctrl:
