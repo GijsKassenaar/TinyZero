@@ -1,7 +1,15 @@
 #!/bin/bash
 # Run checkpoint validation report with trainer-style val-only pipeline,
 # then run quick comparative analysis on the produced outputs.
-# No arguments required; uses built-in defaults and current checkpoint locations.
+#
+# Default behavior:
+# - append one checkpoint into an existing checkpoint_eval run
+# - use quick settings (20-sample validation subset)
+#
+# Common overrides when submitting:
+#   NEW_MODEL_CKPT=test_lead_grpo_new/global_step_75 sbatch scripts/eval_checkpoint_report.job
+#   RUN_DIR=reports/checkpoint_eval/checkpoint_eval_20260401_153904 sbatch scripts/eval_checkpoint_report.job
+#   SAMPLE_COUNT=20 SAMPLE_MODE=random SAMPLE_SEED=42 sbatch scripts/eval_checkpoint_report.job
 
 #SBATCH --job-name=tinyzero_eval_report
 #SBATCH --partition=gpu_h100
@@ -30,43 +38,47 @@ mkdir -p "$WANDB_DIR"
 
 cd "$HOME/TinyZero"
 
-# Default settings are already encoded in the wrapper:
-# - built-in checkpoint set
-# - trainer-style val-only validation
-# - random 20 samples from test split (seed=42)
-# - sequential evaluation and consolidated report outputs
+DATA_DIR=${DATA_DIR:-.}
+SPLIT=${SPLIT:-test}
+SAMPLE_COUNT=${SAMPLE_COUNT:-20}
+SAMPLE_MODE=${SAMPLE_MODE:-random}
+SAMPLE_SEED=${SAMPLE_SEED:-42}
 
-EXISTING_RUN_DIR=$(ls -1d reports/checkpoint_eval/checkpoint_eval_* 2>/dev/null | sort | tail -n1)
-if [[ -z "${EXISTING_RUN_DIR}" ]]; then
-	echo "No existing checkpoint_eval run found under reports/checkpoint_eval"
-	exit 1
-fi
-
-NEW_MODEL_CKPT=$(ls -1d test_grpo_lambda_0.99_reasoning_only/global_step_* 2>/dev/null | sort | tail -n1)
+TARGET_CKPT_ROOT=${TARGET_CKPT_ROOT:-test_lead_grpo_new}
+NEW_MODEL_CKPT=${NEW_MODEL_CKPT:-$(ls -1d "${TARGET_CKPT_ROOT}"/global_step_* 2>/dev/null | sort | tail -n1)}
 
 if [[ -z "${NEW_MODEL_CKPT}" ]]; then
-	# Fallback for runs saved under alternate 0.99 reasoning-only-like names.
-	mapfile -t CKPT_CANDIDATES < <(
-		find . -maxdepth 3 -type d -name 'global_step_*' \
-		| grep -E '/[^/]*grpo_lambda[^/]*0\.99([^0-9]|$)[^/]*(reasoning|sequence_gamma_discount)[^/]*/global_step_[0-9]+$' \
-		| sort
-	)
-
-	if [[ ${#CKPT_CANDIDATES[@]} -eq 0 ]]; then
-		echo "No checkpoint found under test_grpo_lambda_0.99_reasoning_only/global_step_*"
-		echo "Also did not find fallback candidates matching '*grpo_lambda*0.99*(reasoning|sequence_gamma_discount)*/global_step_*'."
-		echo "Available GRPO-lambda checkpoints:"
-		find . -maxdepth 3 -type d -name 'global_step_*' | grep -E '/[^/]*grpo_lambda[^/]*/global_step_[0-9]+$' | sort
-		exit 1
-	fi
-
-	NEW_MODEL_CKPT="${CKPT_CANDIDATES[-1]}"
+  echo "No checkpoint found under ${TARGET_CKPT_ROOT}/global_step_*"
+  exit 1
 fi
 
-echo "Resolved new model checkpoint: ${NEW_MODEL_CKPT}"
+if [[ ! -d "${NEW_MODEL_CKPT}/actor" ]]; then
+  echo "Checkpoint path is missing actor directory: ${NEW_MODEL_CKPT}"
+  exit 1
+fi
 
+if [[ -n "${RUN_DIR:-}" ]]; then
+  EXISTING_RUN_DIR="${RUN_DIR}"
+else
+  EXISTING_RUN_DIR=$(ls -1d reports/checkpoint_eval/checkpoint_eval_* 2>/dev/null | sort | tail -n1)
+fi
+
+if [[ -z "${EXISTING_RUN_DIR}" ]]; then
+  echo "No existing checkpoint_eval run found under reports/checkpoint_eval"
+  exit 1
+fi
+
+echo "Appending checkpoint: ${NEW_MODEL_CKPT}"
+echo "Target run dir: ${EXISTING_RUN_DIR}"
+echo "Sample settings: count=${SAMPLE_COUNT}, mode=${SAMPLE_MODE}, seed=${SAMPLE_SEED}"
+
+DATA_DIR="${DATA_DIR}" \
+SPLIT="${SPLIT}" \
+SAMPLE_COUNT="${SAMPLE_COUNT}" \
+SAMPLE_MODE="${SAMPLE_MODE}" \
+SAMPLE_SEED="${SAMPLE_SEED}" \
 bash scripts/run_checkpoint_eval_report.sh \
-	--checkpoints "${NEW_MODEL_CKPT}" \
-	--append-run-dir "${EXISTING_RUN_DIR}"
+  --checkpoints "${NEW_MODEL_CKPT}" \
+  --append-run-dir "${EXISTING_RUN_DIR}"
 
 python3 scripts/analyze_checkpoint_eval_outputs.py --run-dir "${EXISTING_RUN_DIR}"

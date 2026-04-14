@@ -300,6 +300,12 @@ def logger_literal(logger_mode: str) -> str:
 
 def infer_profile(path_text: str) -> str:
     lower = path_text.lower()
+    if "lead_grpo_lambda" in lower:
+        # Reuse the closest existing eval profile for lambda-based lead runs.
+        return "grpo_lambda_base"
+    if "lead_grpo" in lower:
+        # Reuse normal GRPO eval profile for lead-GRPO runs.
+        return "normal_grpo"
     if "discounted_reasoning" in lower:
         return "discounted_reasoning"
     if "reasoning_only" in lower and "grpo_lambda" in lower:
