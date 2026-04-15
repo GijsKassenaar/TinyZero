@@ -61,7 +61,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.norm_adv_by_std_in_grpo=True \
     algorithm.kl_ctrl.kl_coef=0.001 \
     algorithm.discounted_reasoning.enable=True \
-    algorithm.discounted_reasoning.gamma=0.999 \
+    algorithm.discounted_reasoning.gamma=0.9999 \
     agent.entropy_logging.enable=False \
     agent.adaptive_window.enable=True \
     agent.adaptive_window.mode=phased \
