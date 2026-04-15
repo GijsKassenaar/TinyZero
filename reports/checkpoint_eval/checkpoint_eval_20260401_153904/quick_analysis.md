@@ -3,7 +3,7 @@
 - Run dir: /gpfs/home1/gkassenaar/TinyZero/reports/checkpoint_eval/checkpoint_eval_20260401_153904
 - Baseline: test_normalphased
 - Max response length threshold: 2048
-- Generated: 2026-04-14T16:29:48
+- Generated: 2026-04-14T19:34:09
 
 ## Top Model
 
@@ -21,9 +21,9 @@
 | test_grpo_lambda_0.99 | 0.8000 | 0.8000 | 0.0000 | 0.0000 | 272.5000 | 2048.0000 | 253.0625 | 0.0000 | 1.0000 | 627.6000 | 202.4500 |
 | test_grpo_lambda_0.999_token_normalization | 0.8000 | 0.8000 | 0.0000 | 0.0000 | 106.1875 | 2048.0000 | 87.0000 | 0.0000 | 1.0000 | 494.5500 | 69.6000 |
 | test_discounted_reasoning_0.999 | 0.7500 | 0.7500 | -0.0500 | -0.0500 | 114.4000 | 2048.0000 | 69.4000 | 0.0000 | 1.0000 | 597.8000 | 52.0500 |
+| test_lead_grpo_new | 0.7500 | 0.7500 | -0.0500 | -0.0500 | 110.2667 | 2048.0000 | 91.2000 | 2048.0000 | 1.0000 | 594.7000 | 580.4000 |
 | test_grpo_lambda_sequence_gamma_discount | 0.7000 | 0.7000 | -0.1000 | -0.1000 | 214.2143 | 1456.0000 | 194.9286 | 84.3333 | 0.6667 | 586.7500 | 161.7500 |
 | test_grpo_lambda_second_trace | 0.6000 | 0.6000 | -0.2000 | -0.2000 | 77.6667 | 1798.8750 | 61.0833 | 4.5000 | 0.8750 | 766.1500 | 38.4500 |
-| test_lead_grpo_new | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A | N/A |
 
 ## Notes
 

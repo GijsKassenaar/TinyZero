@@ -15,6 +15,7 @@ Each section starts from the corresponding section in the comprehensive report a
 - [x] Add one quick numeric advantage example per method
 - [x] Attach script mapping for each method
 - [x] Add result placeholders under each section
+- [x] Add loss agg mode section (token-mean vs seq-mean-token-mean)
 - [ ] Fill all sections with measured metrics from runs
 - [ ] Add cross-method comparison table after results are filled
 
@@ -50,6 +51,43 @@ Base GRPO-lambda token advantage:
 $$
 A_{i,t} = \hat{R}_i\, d_{i,t}\, m_{i,t}
 $$
+
+## Loss Aggregation Mode: token-mean vs seq-mean-token-mean
+
+This section explains how per-token losses are reduced to one scalar in training.
+
+Where they appear in recent scripts:
+- token-mean is used in scripts/train_dapo_test.job
+- seq-mean-token-mean is used in scripts/train_gamma_test.job and scripts/train_gamma_additive_tau_test.job
+
+Let $\ell_{i,t}$ be token-level loss for sample $i$, token $t$, and $m_{i,t}\in\{0,1\}$ be the valid-token mask.
+Define valid length $s_i = \sum_t m_{i,t}$.
+
+token-mean:
+
+$$
+\mathcal{L}_{token} = \frac{\sum_i\sum_t \ell_{i,t} m_{i,t}}{\sum_i\sum_t m_{i,t}}
+$$
+
+seq-mean-token-mean:
+
+$$
+\mathcal{L}_{seqtok} = \frac{1}{N_{valid}}\sum_{i:s_i>0}\left(\frac{\sum_t \ell_{i,t} m_{i,t}}{s_i + \epsilon}\right)
+$$
+
+where $N_{valid}$ is number of non-empty sequences in the batch.
+
+In distributed training, the implementation in core_algos.agg_loss also applies a data-parallel scaling factor after normalization.
+
+Quick example:
+- Sequence A has 8 valid tokens with average per-token loss 1.0, so token-sum is 8.
+- Sequence B has 2 valid tokens with average per-token loss 2.0, so token-sum is 4.
+- token-mean gives $(8+4)/(8+2)=1.2$.
+- seq-mean-token-mean gives $(1.0+2.0)/2=1.5$.
+
+Impact intuition:
+- token-mean gives longer responses more influence on the batch loss.
+- seq-mean-token-mean gives each response a more equal contribution regardless of length.
 
 ## 1) Lambda Incorrect Flat Trace
 

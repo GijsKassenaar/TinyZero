@@ -1,0 +1,41 @@
+{
+  "run_name": "checkpoint_eval_20260401_153904",
+  "repo_root": "/gpfs/home1/gkassenaar/TinyZero",
+  "data_dir": "/gpfs/home1/gkassenaar/TinyZero",
+  "split": "test",
+  "sample_count_requested": 20,
+  "sample_count_written": 20,
+  "sample_mode": "random",
+  "sample_seed": 42,
+  "split_total_rows": 1024,
+  "subset_path": "/gpfs/home1/gkassenaar/TinyZero/reports/checkpoint_eval/checkpoint_eval_20260401_153904/subsets/test_random_20.parquet",
+  "last_update_at": "2026-04-14T19:30:48",
+  "last_update_args": {
+    "checkpoints": [
+      "test_lead_grpo_new/global_step_75"
+    ],
+    "checkpoints_file": null,
+    "data_dir": ".",
+    "split": "test",
+    "sample_count": 20,
+    "sample_mode": "random",
+    "sample_seed": 42,
+    "base_model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "n_gpus": 4,
+    "rollout_tp_size": 1,
+    "logger": "console",
+    "project_name": "TinyZero",
+    "output_dir": "reports/checkpoint_eval",
+    "run_name": null,
+    "python": "/home/gkassenaar/.conda/envs/zero/bin/python3",
+    "append_run_dir": "reports/checkpoint_eval/checkpoint_eval_20260401_153904"
+  },
+  "last_update_checkpoints": [
+    {
+      "name": "test_lead_grpo_new",
+      "path": "test_lead_grpo_new/global_step_75",
+      "profile": "normal_grpo"
+    }
+  ],
+  "created_at": "2026-04-14T19:30:48"
+}

@@ -17,7 +17,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=600G
-#SBATCH --time=04:00:00
+#SBATCH --time=0:20:00
 
 module purge
 module load 2025
