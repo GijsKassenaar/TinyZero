@@ -161,6 +161,9 @@ algorithm:
     # Exponential decay base (0 < gamma <= 1)
     gamma: 0.999
 
+    # If True, apply discounted reasoning only for correct samples in mixed groups
+    mixed_groups_only: False
+
   # GRPO-lambda variant controls
   grpo_lambda_variant:
 
@@ -241,6 +244,28 @@ algorithm:
 
     # non_tensor_batch key used to mark per-sample branch identity
     tag_key: branch_mode
+
+  # Two-stage adaptive rollout budgeting for GRPO
+  adaptive_group_budget:
+
+    # Enable adaptive two-stage rollout budgeting
+    enable: False
+
+    # Stage-1 rollout count used for every prompt
+    initial_group_size: 2
+
+    # Nominal group size used to derive per-step rollout budget
+    # (null falls back to actor_rollout_ref.rollout.n)
+    budget_group_size: null
+
+    # Stage-1 sequence reward threshold for correctness
+    correct_threshold: 0.5
+
+    # Remainder allocation strategy when remaining rollouts are not divisible by hard prompts
+    remainder_policy: round_robin
+
+    # Optional cap on final per-prompt group size
+    max_group_size: null
 
 # adaptive window and analysis utilities
 agent:

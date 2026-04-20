@@ -18,6 +18,7 @@ from typing import Any, Optional
 from verl.base_config import BaseConfig
 
 __all__ = [
+    "AdaptiveGroupBudgetConfig",
     "AlgoConfig",
     "DiscountedReasoningConfig",
     "FilterGroupsConfig",
@@ -109,10 +110,13 @@ class DiscountedReasoningConfig(BaseConfig):
     Args:
         enable (bool): Whether to enable reasoning-only discounted reward.
         gamma (float): Exponential decay base in gamma^K, where K is reasoning-token count.
+        mixed_groups_only (bool): If True, apply discount only to correct samples in mixed
+            groups (groups containing at least one correct and one incorrect sample).
     """
 
     enable: bool = False
     gamma: float = 0.999
+    mixed_groups_only: bool = False
 
 
 @dataclass
@@ -192,6 +196,29 @@ class HybridBranchConfig(BaseConfig):
     correct_threshold: float = 0.5
     incorrect_extra_rollouts: int = 3
     tag_key: str = "branch_mode"
+
+
+@dataclass
+class AdaptiveGroupBudgetConfig(BaseConfig):
+    """Configuration for two-stage adaptive GRPO group budgeting.
+
+    Args:
+        enable (bool): Whether to enable adaptive two-stage rollout budgeting.
+        initial_group_size (int): Stage-1 rollouts per prompt before splitting.
+        budget_group_size (Optional[int]): Target group size used to derive total per-step
+            rollout budget (batch_size * budget_group_size). If None, falls back to
+            actor_rollout_ref.rollout.n.
+        correct_threshold (float): Stage-1 sequence reward threshold for correctness.
+        remainder_policy (str): Policy for distributing non-divisible remaining rollouts.
+        max_group_size (Optional[int]): Optional cap on final per-prompt group size.
+    """
+
+    enable: bool = False
+    initial_group_size: int = 2
+    budget_group_size: Optional[int] = None
+    correct_threshold: float = 0.5
+    remainder_policy: str = "round_robin"
+    max_group_size: Optional[int] = None
 
 
 @dataclass
@@ -614,6 +641,8 @@ class AlgoConfig(BaseConfig):
         grpo_lambda_variant (Optional[GRPOLambdaVariantConfig]): GRPO-lambda variant controls.
         sgrpo (Optional[SGRPOConfig]): S-GRPO two-phase serial-group generation settings.
         hybrid_branch (Optional[HybridBranchConfig]): Hybrid branch routing settings for active S-GRPO.
+        adaptive_group_budget (Optional[AdaptiveGroupBudgetConfig]): Two-stage adaptive
+            group budgeting for GRPO rollouts.
         rollout_correction (Optional[RolloutCorrectionConfig]): Rollout Correction configuration.
             Addresses off-policy issues from policy mismatch, model staleness, and general distribution shifts.
 
@@ -648,6 +677,7 @@ class AlgoConfig(BaseConfig):
     grpo_lambda_variant: Optional[GRPOLambdaVariantConfig] = None
     sgrpo: Optional[SGRPOConfig] = None
     hybrid_branch: Optional[HybridBranchConfig] = None
+    adaptive_group_budget: Optional[AdaptiveGroupBudgetConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

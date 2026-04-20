@@ -79,3 +79,20 @@ Expected effect: more length-robust credit assignment, less long-response bias i
 
 Script linkage: `scripts/train_grpo_lambda_group_shortest_trace_test.job`.
 
+## 8) Discounted Reasoning Mixed-Groups-Only (GRPO)
+
+Core idea: keep discounted reasoning under the same GRPO setting, but gate it so gamma discount applies only when a group is mixed (contains at least one correct and one incorrect sample).
+
+Gating rule:
+
+```text
+R_i' = R_i * gamma^K_i, only if (correct_i == 1) and (group_is_mixed == 1)
+R_i' = R_i, otherwise
+```
+
+Why it helps: all-correct groups already have low within-group learning signal for outcome ranking. Skipping extra gamma pressure there focuses updates on unresolved groups where relative discrimination is still needed.
+
+Expected effect: reduced over-regularization on solved groups, while retaining length pressure in mixed groups where policy improvement is still active.
+
+Script linkage: `scripts/train_gamma_mixed_groups_only_test.job`.
+

@@ -60,8 +60,14 @@ def _extract_reasoning_spans(response_text: str) -> tuple[list[str], bool]:
 def _compute_reasoning_token_lengths(
     batch: DataProto, response_length: torch.Tensor, tokenizer: Any
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute per-sample reasoning token counts and whether a closing think tag was found."""
+    """Compute per-sample reasoning token counts and whether reasoning is fully observed.
+
+    A sample is considered fully observed when either:
+    1) A closing think tag is present, or
+    2) The response is clipped at max response length without a closing think tag.
+    """
     responses = batch.batch["responses"]
+    max_response_length = responses.size(1)
     lengths = []
     closed_think = []
 
@@ -77,10 +83,17 @@ def _compute_reasoning_token_lengths(
 
         spans, has_close_tag = _extract_reasoning_spans(response_text)
         reasoning_tokens = 0
-        for span in spans:
-            reasoning_tokens += _tokenize_text_length(span, tokenizer)
+        reasoning_fully_observed = bool(has_close_tag)
+        if has_close_tag:
+            for span in spans:
+                reasoning_tokens += _tokenize_text_length(span, tokenizer)
+        elif valid_len >= max_response_length:
+            # Truncated at max length without a close tag: treat full response as reasoning.
+            reasoning_tokens = valid_len
+            reasoning_fully_observed = True
+
         lengths.append(float(reasoning_tokens))
-        closed_think.append(bool(has_close_tag))
+        closed_think.append(reasoning_fully_observed)
 
     return (
         torch.tensor(lengths, dtype=torch.float32, device=response_length.device),
@@ -160,9 +173,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, tokenizer: A
             - critic/values/mean, max, min: Statistics about critic values (if use_critic=True)
             - critic/vf_explained_var: Explained variance of the value function (if use_critic=True)
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
+            - response_length/mean_correct, mean_incorrect: Mean response length split by correctness
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
                         - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
                         - response_length/mean_reasoning: Mean token length inside thinking tags
+                        - response_length/mean_reasoning_correct, mean_reasoning_incorrect:
+                            Mean reasoning token length split by correctness
                         - response_length/incorrect_non_aborted_mean: Mean response length for incorrect,
                             non-aborted samples
     """
@@ -223,7 +239,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, tokenizer: A
 
     # Incorrect samples excluding aborted responses.
     incorrect_mask = sequence_score < 0.5
+    correct_mask = ~incorrect_mask
+    correct_non_aborted_mask = correct_mask & non_aborted_mask
     incorrect_non_aborted_mask = incorrect_mask & non_aborted_mask
+
+    correct_non_aborted_response_length = response_length[correct_non_aborted_mask]
+    if correct_non_aborted_response_length.numel() > 0:
+        correct_non_aborted_response_length_mean = torch.mean(correct_non_aborted_response_length).detach().item()
+    else:
+        correct_non_aborted_response_length_mean = 0.0
+
     incorrect_non_aborted_response_length = response_length[incorrect_non_aborted_mask]
     if incorrect_non_aborted_response_length.numel() > 0:
         incorrect_non_aborted_response_length_mean = (
@@ -241,8 +266,24 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, tokenizer: A
             mean_reasoning_length = torch.mean(valid_reasoning_lengths).detach().item()
         else:
             mean_reasoning_length = 0.0
+
+        reasoning_correct_mask = reasoning_valid_mask & correct_mask
+        valid_reasoning_lengths_correct = reasoning_token_lengths[reasoning_correct_mask]
+        if valid_reasoning_lengths_correct.numel() > 0:
+            mean_reasoning_length_correct = torch.mean(valid_reasoning_lengths_correct).detach().item()
+        else:
+            mean_reasoning_length_correct = 0.0
+
+        reasoning_incorrect_mask = reasoning_valid_mask & incorrect_mask
+        valid_reasoning_lengths_incorrect = reasoning_token_lengths[reasoning_incorrect_mask]
+        if valid_reasoning_lengths_incorrect.numel() > 0:
+            mean_reasoning_length_incorrect = torch.mean(valid_reasoning_lengths_incorrect).detach().item()
+        else:
+            mean_reasoning_length_incorrect = 0.0
     else:
         mean_reasoning_length = 0.0
+        mean_reasoning_length_correct = 0.0
+        mean_reasoning_length_incorrect = 0.0
 
     metrics = {
         # score
@@ -275,6 +316,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, tokenizer: A
         ),
         # response length
         "response_length/mean": torch.mean(response_length).detach().item(),
+        "response_length/mean_correct": correct_non_aborted_response_length_mean,
+        "response_length/mean_incorrect": incorrect_non_aborted_response_length_mean,
         "response_length/max": torch.max(response_length).detach().item(),
         "response_length/min": torch.min(response_length).detach().item(),
         "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
@@ -287,6 +330,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True, tokenizer: A
         "response_length_non_aborted/min": non_aborted_response_length_min,
         "response_length_non_aborted/clip_ratio": non_aborted_response_length_clip_ratio,
         "response_length/mean_reasoning": mean_reasoning_length,
+        "response_length/mean_reasoning_correct": mean_reasoning_length_correct,
+        "response_length/mean_reasoning_incorrect": mean_reasoning_length_incorrect,
         "response_length/incorrect_non_aborted_mean": incorrect_non_aborted_response_length_mean,
         # aborted ratio
         # Fraction of samples whose response length is zero

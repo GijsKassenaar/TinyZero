@@ -15,6 +15,8 @@
 import re
 from typing import Any, Optional
 
+import numpy as np
+
 import torch
 
 from verl import DataProto
@@ -100,6 +102,8 @@ def compute_reasoning_discount_metrics(
     valid_response_lengths: torch.Tensor,
     gamma: float,
     is_correct: Optional[torch.Tensor] = None,
+    index: Optional[np.ndarray] = None,
+    mixed_groups_only: bool = False,
 ) -> dict[str, float]:
     """Compute discounted-reasoning metrics for the currently discounted sample subset.
 
@@ -115,10 +119,27 @@ def compute_reasoning_discount_metrics(
     valid_response_lengths = valid_response_lengths.to(dtype=torch.long)
 
     valid_reasoning_mask = (valid_response_lengths > 0) & closed_think_tensor
+    mixed_group_mask = torch.ones_like(valid_reasoning_mask, dtype=torch.bool)
     if is_correct is not None:
         correct_mask = is_correct.to(dtype=torch.float32).reshape(-1) > 0.5
         if correct_mask.numel() == valid_reasoning_mask.numel():
             valid_reasoning_mask = valid_reasoning_mask & correct_mask
+            if mixed_groups_only and index is not None and len(index) == valid_reasoning_mask.numel():
+                group_has_correct: dict[Any, bool] = {}
+                group_has_incorrect: dict[Any, bool] = {}
+                for i, group_key in enumerate(index):
+                    is_sample_correct = bool(correct_mask[i].item())
+                    if is_sample_correct:
+                        group_has_correct[group_key] = True
+                    else:
+                        group_has_incorrect[group_key] = True
+
+                mixed_group_mask = torch.zeros_like(valid_reasoning_mask, dtype=torch.bool)
+                for i, group_key in enumerate(index):
+                    mixed_group_mask[i] = bool(group_has_correct.get(group_key, False)) and bool(
+                        group_has_incorrect.get(group_key, False)
+                    )
+                valid_reasoning_mask = valid_reasoning_mask & mixed_group_mask
 
     discount_factors = torch.pow(
         torch.full_like(reasoning_lengths_tensor, gamma, dtype=torch.float32),

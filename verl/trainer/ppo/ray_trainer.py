@@ -42,6 +42,7 @@ from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, Ra
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.adaptive_group_budget import AdaptiveGroupBudgetConfig, AdaptiveGroupBudgetController
 from verl.trainer.ppo.adaptive_window import AdaptiveSuccessWindowConfig, AdaptiveSuccessWindowController
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.discounted_reasoning import compute_reasoning_discount_metrics, compute_reasoning_token_statistics
@@ -249,6 +250,7 @@ def compute_advantage(
 
         reasoning_lengths = None
         reasoning_discount_gamma = None
+        reasoning_discount_mixed_groups_only = False
         reasoning_discount_metrics = None
         discounted_reasoning_cfg = config.get("discounted_reasoning") if config is not None else None
         if discounted_reasoning_cfg is not None and bool(discounted_reasoning_cfg.get("enable", False)):
@@ -258,12 +260,15 @@ def compute_advantage(
                 data, tokenizer
             )
             reasoning_discount_gamma = float(discounted_reasoning_cfg.get("gamma", 1.0))
+            reasoning_discount_mixed_groups_only = bool(discounted_reasoning_cfg.get("mixed_groups_only", False))
             reasoning_discount_metrics = compute_reasoning_discount_metrics(
                 reasoning_lengths_tensor=reasoning_lengths,
                 closed_think_tensor=closed_think_tensor,
                 valid_response_lengths=valid_response_lengths,
                 gamma=reasoning_discount_gamma,
                 is_correct=is_correct,
+                index=data.non_tensor_batch["uid"],
+                mixed_groups_only=reasoning_discount_mixed_groups_only,
             )
 
         response_lengths = grpo_calculation_mask.sum(dim=-1)
@@ -277,6 +282,7 @@ def compute_advantage(
             response_lengths=response_lengths,
             reasoning_lengths=reasoning_lengths,
             reasoning_discount_gamma=reasoning_discount_gamma,
+            reasoning_discount_mixed_groups_only=reasoning_discount_mixed_groups_only,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
         )
@@ -619,6 +625,13 @@ class RayPPOTrainer:
             aw_config = AdaptiveSuccessWindowConfig(**adaptive_cfg_dict)
             self._adaptive_window = AdaptiveSuccessWindowController(config=aw_config)
 
+        self._adaptive_group_budget: Optional[AdaptiveGroupBudgetController] = None
+        adaptive_group_budget_cfg = OmegaConf.select(self.config, "algorithm.adaptive_group_budget")
+        if adaptive_group_budget_cfg is not None and adaptive_group_budget_cfg.get("enable", False):
+            adaptive_group_budget_cfg_dict = OmegaConf.to_container(adaptive_group_budget_cfg, resolve=True)
+            agb_config = AdaptiveGroupBudgetConfig(**adaptive_group_budget_cfg_dict)
+            self._adaptive_group_budget = AdaptiveGroupBudgetController(config=agb_config)
+
         self._sgrpo_controller: Optional[SGRPOController] = None
         sgrpo_cfg = OmegaConf.select(self.config, "algorithm.sgrpo")
         if sgrpo_cfg is not None and sgrpo_cfg.get("enable", False):
@@ -737,6 +750,130 @@ class RayPPOTrainer:
         if self._sgrpo_controller is not None and not sgrpo_active and adv_estimator == AdvantageEstimator.SGRPO:
             return AdvantageEstimator.GRPO
         return adv_estimator
+
+    def _is_adaptive_group_budget_active(
+        self,
+        sgrpo_active: bool,
+        hybrid_branch_active: bool,
+        adv_estimator: AdvantageEstimator,
+    ) -> bool:
+        if self._adaptive_group_budget is None:
+            return False
+        if self.reward_fn is None:
+            return False
+        if sgrpo_active or hybrid_branch_active:
+            return False
+        return adv_estimator in (AdvantageEstimator.GRPO, AdvantageEstimator.GRPO_LAMBDA)
+
+    def _build_adaptive_group_budget_rollouts(
+        self,
+        gen_batch: DataProto,
+        generate_fn,
+        fallback_budget_group_size: int,
+        dp_size: Optional[int] = None,
+    ) -> tuple[DataProto, np.ndarray, dict[str, float]]:
+        """Build two-stage adaptive rollouts and source indices for variable group sizes."""
+        if self._adaptive_group_budget is None:
+            raise RuntimeError("Adaptive group budget controller is not initialized")
+
+        initial_group_size = self._adaptive_group_budget.get_initial_group_size()
+        correctness_threshold = float(self._adaptive_group_budget.config.correct_threshold)
+
+        stage1_gen_batch = gen_batch.repeat(repeat_times=initial_group_size, interleave=True)
+        if stage1_gen_batch.meta_info is None:
+            stage1_gen_batch.meta_info = {}
+        stage1_gen_batch.meta_info[DataProtoConfig.auto_padding_key] = True
+
+        stage1_output = generate_fn(stage1_gen_batch)
+        stage1_timing = dict(stage1_output.meta_info.get("timing", {}))
+        stage1_output.meta_info.pop("timing", None)
+
+        first_pass_reward_result = self._compute_or_extract_reward(
+            stage1_output,
+            reward_fn=self.reward_fn,
+            sum_reward=True,
+        )
+        if isinstance(first_pass_reward_result, tuple):
+            first_pass_rewards = first_pass_reward_result[0]
+        else:
+            first_pass_rewards = first_pass_reward_result
+
+        first_pass_correct = (first_pass_rewards >= correctness_threshold).detach().cpu().numpy().astype(bool)
+        stage1_uids = stage1_output.non_tensor_batch["uid"]
+
+        uid_to_correct = defaultdict(list)
+        for idx, uid in enumerate(stage1_uids):
+            uid_to_correct[uid].append(bool(first_pass_correct[idx]))
+
+        prompt_uids = gen_batch.non_tensor_batch["uid"]
+        hard_prompt_mask = np.zeros(len(prompt_uids), dtype=bool)
+        for idx, uid in enumerate(prompt_uids):
+            if uid not in uid_to_correct or len(uid_to_correct[uid]) == 0:
+                raise RuntimeError(f"Missing stage-1 correctness entries for uid={uid}")
+            hard_prompt_mask[idx] = not all(uid_to_correct[uid])
+
+        extras_per_prompt, allocation_metrics = self._adaptive_group_budget.compute_stage_two_allocation(
+            num_prompts=len(gen_batch),
+            hard_prompt_mask=hard_prompt_mask,
+            fallback_budget_group_size=fallback_budget_group_size,
+        )
+        stage2_prompt_indices = self._adaptive_group_budget.build_stage_two_prompt_indices(extras_per_prompt)
+
+        stage2_output = stage1_output[:0]
+        stage2_timing = {}
+        if len(stage2_prompt_indices) > 0:
+            stage2_gen_batch = gen_batch.select_idxs(stage2_prompt_indices)
+            if stage2_gen_batch.meta_info is None:
+                stage2_gen_batch.meta_info = {}
+            stage2_gen_batch.meta_info[DataProtoConfig.auto_padding_key] = True
+            stage2_output = generate_fn(stage2_gen_batch)
+            stage2_timing = dict(stage2_output.meta_info.get("timing", {}))
+            stage2_output.meta_info.pop("timing", None)
+
+        mixed_output = _concat_dataprotos_non_empty([stage1_output, stage2_output])
+
+        stage1_source_indices = np.repeat(np.arange(len(gen_batch), dtype=np.int64), initial_group_size)
+        mixed_source_indices = np.concatenate(
+            [stage1_source_indices, stage2_prompt_indices.astype(np.int64)],
+            axis=0,
+        )
+
+        padded_samples = 0
+        if dp_size is not None and dp_size > 0 and len(mixed_output) > 0 and len(mixed_output) % dp_size != 0:
+            padded_samples = int(dp_size - (len(mixed_output) % dp_size))
+            pad_indices = np.arange(padded_samples, dtype=np.int64) % len(mixed_output)
+            pad_chunk = mixed_output.select_idxs(pad_indices)
+            mixed_output = _concat_dataprotos_non_empty([mixed_output, pad_chunk])
+            mixed_source_indices = np.concatenate(
+                [mixed_source_indices, mixed_source_indices[pad_indices]],
+                axis=0,
+            )
+
+        if len(mixed_source_indices) != len(mixed_output):
+            raise RuntimeError(
+                "Adaptive group budget source index count does not match mixed output size: "
+                f"{len(mixed_source_indices)} vs {len(mixed_output)}"
+            )
+
+        combined_timing: dict[str, float] = {}
+        for timing_chunk in (stage1_timing, stage2_timing):
+            for key, value in timing_chunk.items():
+                combined_timing[key] = combined_timing.get(key, 0.0) + float(value)
+
+        if mixed_output.meta_info is None:
+            mixed_output.meta_info = {}
+        mixed_output.meta_info["timing"] = combined_timing
+
+        allocation_metrics.update(
+            {
+                "adaptive_group_budget/stage2_batch_size": float(len(stage2_prompt_indices)),
+                "adaptive_group_budget/stage2_call_count": float(1 if len(stage2_prompt_indices) > 0 else 0),
+                "adaptive_group_budget/padded_samples": float(padded_samples),
+                "adaptive_group_budget/final_sample_count": float(len(mixed_output)),
+            }
+        )
+
+        return mixed_output, mixed_source_indices, allocation_metrics
 
     def _build_hybrid_branch_rollouts(
         self,
@@ -1110,10 +1247,18 @@ class RayPPOTrainer:
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
-            _, reasoning_lengths_tensor, _, valid_response_lengths = compute_reasoning_token_statistics(
+            _, reasoning_lengths_tensor, closed_think_tensor, valid_response_lengths = compute_reasoning_token_statistics(
                 batch=test_batch,
                 tokenizer=self.tokenizer,
             )
+            response_len_max = int(test_batch.batch["responses"].shape[-1])
+            truncated_no_close_mask = (valid_response_lengths >= response_len_max) & (~closed_think_tensor)
+            if truncated_no_close_mask.any():
+                reasoning_lengths_tensor = reasoning_lengths_tensor.clone()
+                reasoning_lengths_tensor[truncated_no_close_mask] = valid_response_lengths[
+                    truncated_no_close_mask
+                ].to(dtype=reasoning_lengths_tensor.dtype)
+
             sample_response_lengths.extend(valid_response_lengths.float().cpu().tolist())
             sample_reasoning_lengths.extend(reasoning_lengths_tensor.float().cpu().tolist())
 
@@ -1208,6 +1353,14 @@ class RayPPOTrainer:
             else:
                 metric_dict["val-aux/response_length/mean_correct"] = 0.0
                 metric_dict["val-aux/reasoning_length/mean_correct"] = 0.0
+
+            incorrect_mask = ~correct_mask
+            if np.any(incorrect_mask):
+                metric_dict["val-aux/response_length/mean_incorrect"] = float(response_lengths_arr[incorrect_mask].mean())
+                metric_dict["val-aux/reasoning_length/mean_incorrect"] = float(reasoning_lengths_arr[incorrect_mask].mean())
+            else:
+                metric_dict["val-aux/response_length/mean_incorrect"] = 0.0
+                metric_dict["val-aux/reasoning_length/mean_incorrect"] = 0.0
 
         return metric_dict
 
@@ -1828,15 +1981,24 @@ class RayPPOTrainer:
                     hybrid_branch_active = self._is_hybrid_branch_active(sgrpo_active)
                     current_adv_estimator = self._get_adv_estimator_for_step(sgrpo_active)
                     current_rollout_repeat_times = self._get_sgrpo_rollout_repeat_times(sgrpo_active)
+                    adaptive_group_budget_active = self._is_adaptive_group_budget_active(
+                        sgrpo_active=sgrpo_active,
+                        hybrid_branch_active=hybrid_branch_active,
+                        adv_estimator=current_adv_estimator,
+                    )
                     metrics["sgrpo/active"] = float(sgrpo_active)
                     metrics["hybrid_branch/active"] = float(hybrid_branch_active)
+                    metrics["adaptive_group_budget/active"] = float(adaptive_group_budget_active)
+                    if self._adaptive_group_budget is not None:
+                        disabled_by_mode = not adaptive_group_budget_active
+                        metrics["adaptive_group_budget/disabled_by_mode"] = float(disabled_by_mode)
                     if self._sgrpo_controller is not None:
                         warmup_steps = int(self._sgrpo_controller.config.warmup_steps)
                         metrics["sgrpo/warmup_steps"] = warmup_steps
                         metrics["sgrpo/warmup_steps_remaining"] = max(0, warmup_steps - self.global_steps)
                     metrics["sgrpo/current_rollout_repeat_times"] = current_rollout_repeat_times
 
-                    if not sgrpo_active:
+                    if not sgrpo_active and not adaptive_group_budget_active:
                         gen_batch_output = gen_batch.repeat(
                             repeat_times=current_rollout_repeat_times, interleave=True
                         )
@@ -1845,23 +2007,35 @@ class RayPPOTrainer:
 
                     is_last_step = self.global_steps >= self.total_training_steps
                     hybrid_source_indices = None
+                    adaptive_source_indices = None
                     with marked_timer("step", timing_raw):
                         # generate a batch
                         with marked_timer("gen", timing_raw, color="red"):
                             if not self.async_rollout_mode:
-                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch_output)
+                                generate_fn = self.actor_rollout_wg.generate_sequences
                             else:
-                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                                generate_fn = self.async_rollout_manager.generate_sequences
 
-                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            if adaptive_group_budget_active:
+                                adaptive_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                                (
+                                    gen_batch_output,
+                                    adaptive_source_indices,
+                                    adaptive_group_budget_metrics,
+                                ) = self._build_adaptive_group_budget_rollouts(
+                                    gen_batch=gen_batch,
+                                    generate_fn=generate_fn,
+                                    fallback_budget_group_size=current_rollout_repeat_times,
+                                    dp_size=adaptive_dp_size,
+                                )
+                                metrics.update(adaptive_group_budget_metrics)
+                            else:
+                                gen_batch_output = generate_fn(gen_batch_output)
+
+                            timing_raw.update(gen_batch_output.meta_info.get("timing", {}))
                             gen_batch_output.meta_info.pop("timing", None)
 
                             if sgrpo_active:
-                                if not self.async_rollout_mode:
-                                    generate_fn = self.actor_rollout_wg.generate_sequences
-                                else:
-                                    generate_fn = self.async_rollout_manager.generate_sequences
-
                                 if hybrid_branch_active:
                                     (
                                         gen_batch_output,
@@ -1927,8 +2101,17 @@ class RayPPOTrainer:
                             else:
                                 batch = batch.repeat(repeat_times=self._sgrpo_controller.config.num_exits, interleave=True)
                         else:
-                            batch.meta_info["rollout_repeat_times"] = current_rollout_repeat_times
-                            batch = batch.repeat(repeat_times=current_rollout_repeat_times, interleave=True)
+                            if adaptive_group_budget_active:
+                                if adaptive_source_indices is None:
+                                    raise RuntimeError(
+                                        "Adaptive group budget source indices were not returned."
+                                    )
+                                current_rollout_repeat_times = 1
+                                batch.meta_info["rollout_repeat_times"] = 1
+                                batch = batch.select_idxs(adaptive_source_indices)
+                            else:
+                                batch.meta_info["rollout_repeat_times"] = current_rollout_repeat_times
+                                batch = batch.repeat(repeat_times=current_rollout_repeat_times, interleave=True)
                         batch = batch.union(gen_batch_output)
                         if exit_orders is not None:
                             batch.batch["exit_order"] = exit_orders

@@ -1,0 +1,575 @@
+% Options for packages loaded elsewhere
+\PassOptionsToPackage{unicode}{hyperref}
+\PassOptionsToPackage{hyphens}{url}
+\documentclass[
+]{article}
+\usepackage{xcolor}
+\usepackage{amsmath,amssymb}
+\setcounter{secnumdepth}{-\maxdimen} % remove section numbering
+\usepackage{iftex}
+\ifPDFTeX
+  \usepackage[T1]{fontenc}
+  \usepackage[utf8]{inputenc}
+  \usepackage{textcomp} % provide euro and other symbols
+\else % if luatex or xetex
+  \usepackage{unicode-math} % this also loads fontspec
+  \defaultfontfeatures{Scale=MatchLowercase}
+  \defaultfontfeatures[\rmfamily]{Ligatures=TeX,Scale=1}
+\fi
+\usepackage{lmodern}
+\ifPDFTeX\else
+  % xetex/luatex font selection
+\fi
+% Use upquote if available, for straight quotes in verbatim environments
+\IfFileExists{upquote.sty}{\usepackage{upquote}}{}
+\IfFileExists{microtype.sty}{% use microtype if available
+  \usepackage[]{microtype}
+  \UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts
+}{}
+\makeatletter
+\@ifundefined{KOMAClassName}{% if non-KOMA class
+  \IfFileExists{parskip.sty}{%
+    \usepackage{parskip}
+  }{% else
+    \setlength{\parindent}{0pt}
+    \setlength{\parskip}{6pt plus 2pt minus 1pt}}
+}{% if KOMA class
+  \KOMAoptions{parskip=half}}
+\makeatother
+\setlength{\emergencystretch}{3em} % prevent overfull lines
+\providecommand{\tightlist}{%
+  \setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}}
+\usepackage{bookmark}
+\IfFileExists{xurl.sty}{\usepackage{xurl}}{} % add URL line breaks if available
+\urlstyle{same}
+\hypersetup{
+  hidelinks,
+  pdfcreator={LaTeX via pandoc}}
+
+\author{}
+\date{}
+
+\begin{document}
+
+\section{Recent Methods}\label{recent-methods}
+
+\subsection{Shared Notation}\label{shared-notation}
+
+For rollout i in group g and token t:
+
+\[
+R_i = \sum_t r_{i,t} m_{i,t}
+\]
+
+where \(m_{i,t}\in\{0,1\}\) is the valid-token mask.
+
+Group normalization:
+
+\[
+\mu_g = \frac{1}{|g|}\sum_{i\in g} R_i, \quad
+\sigma_g = \sqrt{\frac{1}{|g|}\sum_{i\in g}(R_i-\mu_g)^2}
+\]
+
+\[
+\hat{R}_i = \frac{R_i-\mu_g}{\sigma_g + \delta}
+\]
+
+Base lambda trace (end-aligned):
+
+\[
+d_{i,t} = (\gamma\lambda)^{T_i-1-t}
+\]
+
+Base GRPO-lambda token advantage:
+
+\[
+A_{i,t} = \hat{R}_i\, d_{i,t}\, m_{i,t}
+\]
+
+\subsection{Loss Aggregation Mode: token-mean vs
+seq-mean-token-mean}\label{loss-aggregation-mode-token-mean-vs-seq-mean-token-mean}
+
+This section explains how per-token losses are reduced to one scalar in
+training.
+
+Where they appear in recent scripts:
+
+\begin{itemize}
+\tightlist
+\item
+  token-mean is used in scripts/train\_dapo\_test.job
+\item
+  seq-mean-token-mean is used in scripts/train\_gamma\_test.job and
+  scripts/train\_gamma\_additive\_tau\_test.job
+\end{itemize}
+
+Let \(\ell_{i,t}\) be token-level loss for sample \(i\), token \(t\),
+and \(m_{i,t}\in\{0,1\}\) be the valid-token mask. Define valid length
+\(s_i = \sum_t m_{i,t}\).
+
+token-mean:
+
+\[
+\mathcal{L}_{token} = \frac{\sum_i\sum_t \ell_{i,t} m_{i,t}}{\sum_i\sum_t m_{i,t}}
+\]
+
+seq-mean-token-mean:
+
+\[
+\mathcal{L}_{seqtok} = \frac{1}{N_{valid}}\sum_{i:s_i>0}\left(\frac{\sum_t \ell_{i,t} m_{i,t}}{s_i + \epsilon}\right)
+\]
+
+where \(N_{valid}\) is number of non-empty sequences in the batch.
+
+In distributed training, the implementation in core\_algos.agg\_loss
+also applies a data-parallel scaling factor after normalization.
+
+Quick example:
+
+\begin{itemize}
+\tightlist
+\item
+  Sequence A has 8 valid tokens with average per-token loss 1.0, so
+  token-sum is 8.
+\item
+  Sequence B has 2 valid tokens with average per-token loss 2.0, so
+  token-sum is 4.
+\item
+  token-mean gives \((8+4)/(8+2)=1.2\).
+\item
+  seq-mean-token-mean gives \((1.0+2.0)/2=1.5\).
+\end{itemize}
+
+Impact intuition:
+
+\begin{itemize}
+\tightlist
+\item
+  token-mean gives longer responses more influence on the batch loss.
+\item
+  seq-mean-token-mean gives each response a more equal contribution
+  regardless of length.
+\end{itemize}
+
+\subsection{1) Lambda Incorrect Flat
+Trace}\label{lambda-incorrect-flat-trace}
+
+Source in comprehensive report: GRPO-lambda Variant A - Flat Incorrect
+Trace.
+
+Primary script:
+
+\begin{itemize}
+\tightlist
+\item
+  scripts/train\_grpo\_lambda\_flat\_incorrect\_trace\_test.job
+\end{itemize}
+
+Core modification:
+
+\[
+A_{i,t} = \hat{R}_i \cdot \big(c_i d_{i,t} + (1-c_i)\cdot 1\big) \cdot m_{i,t}
+\]
+
+where \(c_i=1\) for correct and \(c_i=0\) for incorrect.
+
+Quick example:
+
+\begin{itemize}
+\item
+  Assume \(\hat{R}_{correct}=+1\), \(\hat{R}_{incorrect}=-1\),
+  \(\gamma\lambda=0.99\), \(T=4\).
+\item
+  Decay trace for correct: \([0.970, 0.980, 0.990, 1.000]\).
+\item
+  Incorrect flat trace: \([1,1,1,1]\).
+\item
+  Advantages:
+
+  \begin{itemize}
+  \tightlist
+  \item
+    Correct: \([+0.970,+0.980,+0.990,+1.000]\)
+  \item
+    Incorrect: \([-1.000,-1.000,-1.000,-1.000]\)
+  \end{itemize}
+\end{itemize}
+
+Impact intuition:
+
+\begin{itemize}
+\tightlist
+\item
+  Lambda also discount the neagitve advantage of incorrect traces. with
+  a flat trace for incorrect answers the full rollout is counted
+  inccorect
+\end{itemize}
+
+Results:
+
+\begin{itemize}
+\tightlist
+\item
+  Accuracy: 0.6
+\item
+  Effect on length: Answers become longer especially easy ones
+\item
+  Notes: Since neagtive advantages are not discounted there is an
+  imbalance in the loss which causes instability. perfromance is much
+  worse.
+\end{itemize}
+
+\subsection{2) Lambda + Gamma (Lambda Sequence Gamma
+Discount)}\label{lambda-gamma-lambda-sequence-gamma-discount}
+
+Source in comprehensive report: GRPO-lambda Variant B - Sequence Gamma
+Discount + Reasoning-only Trace.
+
+Primary script:
+
+\begin{itemize}
+\tightlist
+\item
+  scripts/train\_lambda\_gamma.job
+\end{itemize}
+
+Core modification:
+
+\[
+R_i^{seq} =
+\begin{cases}
+R_i\,\gamma_s^{K_i}, & c_i=1 \\
+R_i, & c_i=0
+\end{cases}
+\]
+
+then group normalization and lambda trace proceed as usual:
+
+\[
+\hat{R}_i = \frac{R_i^{seq}-\mu_g}{\sigma_g+\delta},\quad
+A_{i,t}=\hat{R}_i d_{i,t}m_{i,t}
+\]
+
+Quick example:
+
+\begin{itemize}
+\item
+  With script-like \(\gamma_s=0.99999999\):
+
+  \begin{itemize}
+  \tightlist
+  \item
+    \(K=200\): \(\gamma_s^K \approx 0.999998\)
+  \item
+    \(K=2000\): \(\gamma_s^K \approx 0.999980\)
+  \end{itemize}
+\item
+  The discount is intentionally very mild at this gamma.
+\end{itemize}
+
+Impact intuition:
+
+\begin{itemize}
+\tightlist
+\item
+  Combines the effect of gamma and lambda discount. The learning effect
+  of lambda with the more effective lenght penalties of gamma.
+\end{itemize}
+
+Results:
+
+\begin{itemize}
+\tightlist
+\item
+  Accuracy: 0.67
+\item
+  Effect on length: does not lower length compared to lambda only.
+\item
+  Notes: Used a very small gamma discount for minimal effect. did not
+  lower length but did lower accuracy.
+\end{itemize}
+
+\subsection{3) Lambda 0.99 Reasoning
+Only}\label{lambda-0.99-reasoning-only}
+
+Source relation: reasoning-only trace component used in lambda variant
+controls.
+
+Closest script surface:
+
+\begin{itemize}
+\tightlist
+\item
+  scripts/train\_lambda\_gamma.job
+  (reasoning\_only\_discount\_trace\_enable=True)
+\end{itemize}
+
+Core modification:
+
+Define reasoning mask \(q_{i,t}\in\{0,1\}\). Only reasoning tokens
+receive trace decay:
+
+\[
+d^{reason}_{i,t} = q_{i,t}d_{i,t} + (1-q_{i,t})\cdot 1
+\]
+
+\[
+A_{i,t}=\hat{R}_i d^{reason}_{i,t} m_{i,t}
+\]
+
+Quick example:
+
+\begin{itemize}
+\tightlist
+\item
+  Let \(\lambda=0.99\), \(\gamma=1\),
+  \(d=[0.961,0.970,0.980,0.990,1.000]\).
+\item
+  Reasoning mask \(q=[1,1,1,0,0]\).
+\item
+  Effective trace becomes \([0.961,0.970,0.980,1.000,1.000]\).
+\end{itemize}
+
+Impact intuition:
+
+\begin{itemize}
+\tightlist
+\item
+  Decay pressure is concentrated on reasoning span, while answer tokens
+  are preserved from extra decay.
+\end{itemize}
+
+Results:
+
+\begin{itemize}
+\tightlist
+\item
+  Accuracy: 0.58
+\item
+  Effect on length: Heavily discount reasoning but answer become
+  extremly long
+\item
+  Notes: model is incentivized to stop reasoning tokens and instead
+  reason within the answer.
+\end{itemize}
+
+\subsection{4) GRPO Lambda Group Shortest Alpha
+Trace}\label{grpo-lambda-group-shortest-alpha-trace}
+
+Source in comprehensive report: GRPO-lambda Variant F - Group-Shortest
+Trace Base.
+
+Primary script:
+
+\begin{itemize}
+\tightlist
+\item
+  scripts/train\_grpo\_lambda\_group\_shortest\_trace\_test.job
+\end{itemize}
+
+Core modification:
+
+For group g, let shortest valid length be \(L_{min,g}\) and configured
+alpha be \(\alpha_s\). Adaptive lambda-token base:
+
+\[
+\lambda_{token,g} = \alpha_s^{1/(L_{min,g}-1)}
+\]
+
+Trace:
+
+\[
+d_{i,t}=\lambda_{token,g}^{e_{i,t}}, \quad e_{i,t}=T_i-1-t
+\]
+
+Advantage:
+
+\[
+A_{i,t}=\hat{R}_i d_{i,t} m_{i,t}
+\]
+
+Quick example:
+
+\begin{itemize}
+\tightlist
+\item
+  \(L_{min}=100\), \(\alpha_s=0.15\).
+\item
+  \(\lambda_{token,g}=0.15^{1/99}\approx0.981\).
+\item
+  Shortest sample first-token weight: \(0.981^{99}=0.15\).
+\item
+  Longer sample with \(T=200\) first-token weight:
+  \(0.981^{199}\approx0.022\).
+\end{itemize}
+
+Impact intuition:
+
+\begin{itemize}
+\tightlist
+\item
+  Instead of having the same lambda for each group, adapt it on the
+  shortest answer in group, so that for the shortest correct answers in
+  the group there is some signal for every token. for long answers this
+  means less discounting, for shorter answers more discounting
+\end{itemize}
+
+Results:
+
+\begin{itemize}
+\tightlist
+\item
+  Accuracy: 0.68
+\item
+  Effect on length: lenght becomes higher compared to lambda
+\item
+  Notes: expected rise in accuracy since for long answers on difficult
+  questions the discounting is less strong. actual perfromace is
+  slightly worse.
+\end{itemize}
+
+\subsection{5) Gamma 0.999 Additive Tau}\label{gamma-0.999-additive-tau}
+
+Core modification (plain GRPO):
+
+Correct samples are discounted by reasoning length:
+
+\[
+R_i' =
+\begin{cases}
+R_i\gamma^{K_i}, & c_i=1 \\
+R_i, & c_i=0
+\end{cases}
+\]
+
+Then normalized with additive tau:
+
+\[
+\hat{R}_i = \frac{R_i'-\mu_g}{\sigma_g+\tau}, \quad
+A_{i,t}=\hat{R}_i m_{i,t}
+\]
+
+Quick example:
+
+\begin{itemize}
+\tightlist
+\item
+  Discounted sequence rewards in one group: \([0.74,0.73,0.72,0.71]\).
+\item
+  \(\mu_g=0.725\), \(\sigma_g\approx0.0112\).
+\item
+  Top centered value: \(0.015\).
+\item
+  Without tau: \(0.015/0.0112\approx1.34\).
+\item
+  With \(\tau=0.02\): \(0.015/(0.0112+0.02)\approx0.48\).
+\end{itemize}
+
+Impact intuition:
+
+\begin{itemize}
+\tightlist
+\item
+  Gamma introduces length pressure; tau basically dampens the advantages
+  if the reward differnce is small.
+\end{itemize}
+
+Results:
+
+\begin{itemize}
+\tightlist
+\item
+  Accuracy: 0.66 ,for tau=0.02
+\item
+  Effect on length: longer than gamma but still much lower then gamma
+  and baseline
+\item
+  Notes: Works great. increases gamma perfromance. still need to fin
+  optimal tau
+\end{itemize}
+
+\subsection{6) Gamma 0.99 Additive Tau + Incorrect
+Penalty}\label{gamma-0.99-additive-tau-incorrect-penalty}
+
+Requested target method:
+
+\begin{itemize}
+\tightlist
+\item
+  gamma 0.99 additive tau plus incorrect penalty
+\end{itemize}
+
+Closest existing surface:
+
+\begin{itemize}
+\tightlist
+\item
+  scripts/train\_gamma\_additive\_tau\_test.job (same structure,
+  currently gamma=0.999 and incorrect penalty enabled)
+\end{itemize}
+
+Core modification:
+
+Incorrect answers are given reward of -1 instead of 0:
+
+\[
+R_i' =
+\begin{cases}
+R_i^{pen}\gamma^{K_i}, & c_i=1 \\
+-1, & c_i=0
+\end{cases}
+\]
+
+Then additive-tau normalization:
+
+\[
+\hat{R}_i=\frac{R_i'-\mu_g}{\sigma_g+\tau}, \quad A_{i,t}=\hat{R}_i m_{i,t}
+\]
+
+Quick example (gamma=0.99):
+
+\begin{itemize}
+\item
+  Two correct samples with raw score 1 and \(K=[30,120]\): discounted to
+  \([0.740,0.299]\).
+\item
+  Two incorrect samples penalized to \([-1,-1]\).
+\item
+  Group scores: \([0.740,0.299,-1,-1]\).
+\item
+  \(\mu_g\approx-0.240\), \(\sigma_g\approx0.776\).
+\item
+  With \(\tau=0.02\), normalized scores become approximately:
+
+  \begin{itemize}
+  \tightlist
+  \item
+    \([+1.232, +0.678, -0.955, -0.955]\).
+  \end{itemize}
+\end{itemize}
+
+Impact intuition:
+
+\begin{itemize}
+\tightlist
+\item
+  incorrect penalty comes from the LEAD method. gamma discounts can set
+  reward for long rollouts to close to 0, this creates a bigger gap
+  between long answers and incorrect answers
+\end{itemize}
+
+Results:
+
+\begin{itemize}
+\tightlist
+\item
+  Accuracy: 0.65
+\item
+  Effect on length: no meaningful differnece compared to no incorrect
+  penalty
+\item
+  Notes: surprsingly no positve effect for longer answers. slighty
+  decreases performance across the board
+\end{itemize}
+
+\end{document}

@@ -272,6 +272,7 @@ def compute_grpo_outcome_advantage(
     response_lengths: Optional[torch.Tensor] = None,
     reasoning_lengths: Optional[torch.Tensor] = None,
     reasoning_discount_gamma: Optional[float] = None,
+    reasoning_discount_mixed_groups_only: bool = False,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -383,7 +384,23 @@ def compute_grpo_outcome_advantage(
                 raise ValueError(f"discounted_reasoning.gamma must satisfy 0 < gamma <= 1, got {gamma}")
             reasoning_lengths = reasoning_lengths.to(device=scores.device, dtype=scores.dtype)
             discount_factors = torch.pow(torch.full_like(reasoning_lengths, gamma), reasoning_lengths)
-            scores = torch.where(is_correct > 0.5, scores * discount_factors, scores)
+            discount_mask = is_correct > 0.5
+            if reasoning_discount_mixed_groups_only:
+                group_has_correct: dict[Any, bool] = defaultdict(bool)
+                group_has_incorrect: dict[Any, bool] = defaultdict(bool)
+                for i in range(bsz):
+                    group_key = index[i]
+                    if bool((is_correct[i] > 0.5).item()):
+                        group_has_correct[group_key] = True
+                    else:
+                        group_has_incorrect[group_key] = True
+                mixed_group_mask = torch.zeros_like(discount_mask, dtype=torch.bool)
+                for i in range(bsz):
+                    group_key = index[i]
+                    mixed_group_mask[i] = group_has_correct[group_key] and group_has_incorrect[group_key]
+                discount_mask = discount_mask & mixed_group_mask
+
+            scores = torch.where(discount_mask, scores * discount_factors, scores)
 
         for i in range(bsz):
             id2score[index[i]].append(scores[i])
