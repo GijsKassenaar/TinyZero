@@ -1,0 +1,236 @@
+#!/bin/bash
+# Comprehensive comparison launcher:
+# 4 methods x 3 seeds = 12 runs via a single Slurm job array.
+#
+# Methods:
+#   1) normalphased (baseline)
+#   2) grpo_lambda
+#   3) gamma
+#   4) gamma + tau
+
+#SBATCH --job-name=tinyzero_cmp4
+#SBATCH --partition=gpu_h100
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=600G
+#SBATCH --time=03:00:00
+#SBATCH --array=0-11%1
+
+set -euo pipefail
+
+module purge
+module load 2025
+module load CUDA/12.8.0
+
+source ~/.bashrc
+conda activate zero
+
+# Ensure ROCm vars do not conflict with CUDA
+unset ROCR_VISIBLE_DEVICES
+unset HIP_VISIBLE_DEVICES
+
+export HF_HOME=/scratch-shared/$USER/huggingface
+mkdir -p "$HF_HOME"
+
+export WANDB__SERVICE_WAIT=300
+export WANDB_DIR=/scratch-shared/$USER/wandb
+mkdir -p "$WANDB_DIR"
+
+cd "$HOME/TinyZero"
+
+export N_GPUS=${N_GPUS:-4}
+export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
+export DATA_DIR=${DATA_DIR:-$PWD}
+export BASE_MODEL=${BASE_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
+export PROJECT_NAME=${PROJECT_NAME:-TinyZero}
+
+# Optional tag to group all runs in W&B/checkpoint names.
+export COMPARISON_TAG=${COMPARISON_TAG:-comparison_4methods_3seeds}
+
+# You can override seeds by exporting SEEDS_CSV, e.g. "11,22,33".
+SEEDS_CSV=${SEEDS_CSV:-11,22,33}
+IFS=',' read -r -a SEEDS <<< "$SEEDS_CSV"
+
+METHODS=(
+    normalphased
+    grpo_lambda
+    gamma
+    gamma_tau
+)
+
+TOTAL_TASKS=$(( ${#METHODS[@]} * ${#SEEDS[@]} ))
+TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
+
+if (( TASK_ID < 0 || TASK_ID >= TOTAL_TASKS )); then
+    echo "Invalid task id ${TASK_ID}. Expected 0..$((TOTAL_TASKS - 1))."
+    exit 1
+fi
+
+METHOD_IDX=$(( TASK_ID / ${#SEEDS[@]} ))
+SEED_IDX=$(( TASK_ID % ${#SEEDS[@]} ))
+
+METHOD=${METHODS[$METHOD_IDX]}
+SEED=${SEEDS[$SEED_IDX]}
+
+TAU=${TAU:-0.04}
+TAU_TAG=${TAU//./p}
+
+EXPERIMENT_NAME="${COMPARISON_TAG}_${METHOD}_seed${SEED}"
+if [[ "$METHOD" == "gamma_tau" ]]; then
+    EXPERIMENT_NAME="${COMPARISON_TAG}_${METHOD}_tau${TAU_TAG}_seed${SEED}"
+fi
+
+LOG_DIR=${LOG_DIR:-logs/comparison_4methods_3seeds}
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/${EXPERIMENT_NAME}.log"
+
+DRY_RUN=${DRY_RUN:-0}
+
+echo "========================================"
+echo "Task ID        : $TASK_ID / $((TOTAL_TASKS - 1))"
+echo "Method         : $METHOD"
+echo "Seed           : $SEED"
+echo "Experiment     : $EXPERIMENT_NAME"
+echo "Log file       : $LOG_FILE"
+echo "Base model     : $BASE_MODEL"
+echo "Data dir       : $DATA_DIR"
+echo "GPUs           : $N_GPUS"
+echo "Rollout TP     : $ROLLOUT_TP_SIZE"
+echo "========================================"
+
+COMMON_ARGS=(
+    "data.train_files=$DATA_DIR/train.parquet"
+    "data.val_files=$DATA_DIR/test.parquet"
+    "data.train_batch_size=256"
+    "data.val_batch_size=256"
+    "data.dataloader_num_workers=2"
+    "data.max_prompt_length=256"
+    "data.max_response_length=2048"
+    "data.seed=$SEED"
+
+    "actor_rollout_ref.model.path=$BASE_MODEL"
+    "actor_rollout_ref.model.use_remove_padding=True"
+
+    "actor_rollout_ref.actor.use_dynamic_bsz=True"
+    "actor_rollout_ref.actor.optim.lr=1e-6"
+    "actor_rollout_ref.actor.loss_agg_mode=token-mean"
+    "actor_rollout_ref.actor.ppo_mini_batch_size=32"
+    "actor_rollout_ref.actor.ppo_micro_batch_size=8"
+    "actor_rollout_ref.actor.data_loader_seed=$SEED"
+    "actor_rollout_ref.actor.fsdp_config.seed=$SEED"
+
+    "actor_rollout_ref.rollout.n=4"
+    "actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE"
+    "actor_rollout_ref.rollout.name=vllm"
+    "actor_rollout_ref.rollout.gpu_memory_utilization=0.5"
+    "actor_rollout_ref.rollout.log_prob_micro_batch_size=32"
+
+    "actor_rollout_ref.ref.log_prob_micro_batch_size=8"
+    "actor_rollout_ref.ref.fsdp_config.seed=$SEED"
+
+    "algorithm.norm_adv_by_std_in_grpo=True"
+    "algorithm.use_kl_in_reward=False"
+    "algorithm.kl_ctrl.kl_coef=0.001"
+
+    "agent.entropy_logging.enable=False"
+
+    "critic.data_loader_seed=$SEED"
+    "critic.model.fsdp_config.seed=$SEED"
+
+    "trainer.n_gpus_per_node=$N_GPUS"
+    "trainer.nnodes=1"
+    "trainer.resume_mode=auto"
+    "trainer.total_training_steps=75"
+    "trainer.save_freq=75"
+    "trainer.test_freq=15"
+    "trainer.val_before_train=False"
+    'trainer.logger=["console","wandb"]'
+    "trainer.project_name=$PROJECT_NAME"
+    "trainer.experiment_name=$EXPERIMENT_NAME"
+    "trainer.default_local_dir=$EXPERIMENT_NAME"
+)
+
+METHOD_ARGS=()
+case "$METHOD" in
+    normalphased)
+        METHOD_ARGS=(
+            "algorithm.adv_estimator=grpo"
+
+            "agent.adaptive_window.enable=True"
+            "agent.adaptive_window.mode=phased"
+            "agent.adaptive_window.initial_window=1024"
+            "agent.adaptive_window.max_window=2048"
+            'agent.adaptive_window.phased_schedule=[[50,2048]]'
+        )
+        ;;
+
+    grpo_lambda)
+        METHOD_ARGS=(
+            "actor_rollout_ref.actor.policy_loss.loss_mode=grpo_lambda"
+            "actor_rollout_ref.rollout.gpu_memory_utilization=0.6"
+
+            "critic.enable=False"
+
+            "algorithm.adv_estimator=grpo_lambda"
+            "algorithm.gamma=1.0"
+            "algorithm.lam=0.99"
+            "algorithm.grpo_lambda_variant.enable=False"
+            "algorithm.grpo_lambda_variant.reasoning_only_discount_trace_enable=False"
+
+            "agent.adaptive_window.enable=True"
+            "agent.adaptive_window.mode=phased"
+            "agent.adaptive_window.initial_window=1024"
+            "agent.adaptive_window.max_window=2048"
+            'agent.adaptive_window.phased_schedule=[[50,2048]]'
+        )
+        ;;
+
+    gamma)
+        METHOD_ARGS=(
+            "algorithm.adv_estimator=grpo"
+            "algorithm.discounted_reasoning.enable=True"
+            "algorithm.discounted_reasoning.gamma=0.999"
+
+            "agent.adaptive_window.enable=True"
+            "agent.adaptive_window.mode=phased"
+            "agent.adaptive_window.initial_window=1024"
+            "agent.adaptive_window.max_window=2048"
+            'agent.adaptive_window.phased_schedule=[[50,2048]]'
+        )
+        ;;
+
+    gamma_tau)
+        METHOD_ARGS=(
+            "algorithm.adv_estimator=grpo"
+            "algorithm.discounted_reasoning.enable=True"
+            "algorithm.discounted_reasoning.gamma=0.999"
+            "algorithm.grpo_additive_normalization_enable=True"
+            "algorithm.grpo_additive_normalization_tau=$TAU"
+            "algorithm.incorrect_answer_penalty.enable=False"
+            "algorithm.incorrect_answer_penalty.penalty=-1.0"
+
+            "agent.adaptive_window.enable=True"
+            "agent.adaptive_window.mode=phased"
+            "agent.adaptive_window.initial_window=1024"
+            "agent.adaptive_window.max_window=2048"
+            'agent.adaptive_window.phased_schedule=[[20,2048]]'
+        )
+        ;;
+
+    *)
+        echo "Unknown method: $METHOD"
+        exit 1
+        ;;
+esac
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    echo "DRY_RUN=1 -> command preview only (no training started)."
+    echo "python3 -m verl.trainer.main_ppo ${COMMON_ARGS[*]} ${METHOD_ARGS[*]}"
+    exit 0
+fi
+
+python3 -m verl.trainer.main_ppo \
+    "${COMMON_ARGS[@]}" \
+    "${METHOD_ARGS[@]}" \
+    2>&1 | tee "$LOG_FILE"

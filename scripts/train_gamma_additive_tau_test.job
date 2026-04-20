@@ -35,9 +35,18 @@ export DATA_DIR=$PWD
 export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
 
 # Resume the existing tau=0.07 run from global_step_30 and continue to step 75.
-TAU=0.07
+TAU=0.04
 TAU_TAG="${TAU//./p}"
 export EXPERIMENT_NAME="test_gamma_0.999_addtau_${TAU_TAG}_incorrect_penalty_30steps"
+export CHECKPOINT_DIR=$EXPERIMENT_NAME
+export RESUME_STEP=30
+export RESUME_FROM_PATH=$CHECKPOINT_DIR/global_step_$RESUME_STEP
+
+
+if [ ! -d "$RESUME_FROM_PATH" ]; then
+    echo "Checkpoint not found: $RESUME_FROM_PATH"
+    exit 1
+fi
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
@@ -75,10 +84,11 @@ python3 -m verl.trainer.main_ppo \
     agent.adaptive_window.mode=phased \
     agent.adaptive_window.initial_window=1024 \
     agent.adaptive_window.max_window=2048 \
-    agent.adaptive_window.phased_schedule='[[20,2048]]' \
+    agent.adaptive_window.phased_schedule="[[20,2048]]" \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.resume_mode=auto \
+    trainer.resume_mode=resume_path \
+    trainer.resume_from_path=$RESUME_FROM_PATH \
     trainer.total_training_steps=75 \
     trainer.save_freq=75 \
     trainer.test_freq=15 \

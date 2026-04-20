@@ -33,7 +33,7 @@ export N_GPUS=4
 export ROLLOUT_TP_SIZE=1
 export DATA_DIR=$PWD
 export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-export EXPERIMENT_NAME=test_grpo_lambda_sequence_gamma_discount
+export EXPERIMENT_NAME=test_grpo_lambda_sequence_gamma_discount_0.999999
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
@@ -66,7 +66,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.grpo_lambda_variant.enable=True \
     algorithm.grpo_lambda_variant.flat_incorrect_trace=False \
     algorithm.grpo_lambda_variant.sequence_gamma_discount_enable=True \
-    algorithm.grpo_lambda_variant.sequence_discount_gamma=0.99999999 \
+    algorithm.grpo_lambda_variant.sequence_discount_gamma=0.999999 \
     algorithm.grpo_lambda_variant.reasoning_only_discount_trace_enable=True \
     agent.entropy_logging.enable=False \
     agent.adaptive_window.enable=True \
@@ -77,8 +77,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.resume_mode=auto \
-    trainer.total_training_steps=75 \
-    trainer.save_freq=75 \
+    trainer.total_training_steps=30 \
+    trainer.save_freq=30 \
     trainer.test_freq=15 \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
