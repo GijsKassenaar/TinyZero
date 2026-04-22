@@ -799,7 +799,19 @@ class RayPPOTrainer:
             first_pass_rewards = first_pass_reward_result
 
         first_pass_correct = (first_pass_rewards >= correctness_threshold).detach().cpu().numpy().astype(bool)
-        stage1_uids = stage1_output.non_tensor_batch["uid"]
+        # Async rollout outputs can omit non-tensor fields; fall back to stage-1 input UID.
+        if "uid" in stage1_output.non_tensor_batch:
+            stage1_uids = stage1_output.non_tensor_batch["uid"]
+        else:
+            stage1_uids = stage1_gen_batch.non_tensor_batch.get("uid")
+            if stage1_uids is None:
+                raise RuntimeError("uid is missing from both stage-1 rollout output and input batch")
+
+        if len(stage1_uids) != len(first_pass_correct):
+            raise RuntimeError(
+                "Stage-1 uid count does not match first-pass reward count: "
+                f"{len(stage1_uids)} vs {len(first_pass_correct)}"
+            )
 
         uid_to_correct = defaultdict(list)
         for idx, uid in enumerate(stage1_uids):
@@ -1361,6 +1373,35 @@ class RayPPOTrainer:
             else:
                 metric_dict["val-aux/response_length/mean_incorrect"] = 0.0
                 metric_dict["val-aux/reasoning_length/mean_incorrect"] = 0.0
+
+        if len(sample_gts) > 0 and len(sample_is_correct) > 0:
+            n = min(len(sample_gts), len(sample_is_correct))
+            diff_stats: dict[int, dict[str, int]] = {
+                3: {"total": 0, "correct": 0},
+                4: {"total": 0, "correct": 0},
+            }
+
+            # Prefer explicit difficulty labels when present; otherwise use operand count.
+            for gt, is_correct in zip(sample_gts[:n], sample_is_correct[:n]):
+                if not isinstance(gt, dict):
+                    continue
+
+                difficulty = gt.get("difficulty", None)
+                if difficulty is None:
+                    numbers = gt.get("numbers", None)
+                    if isinstance(numbers, (list, tuple, np.ndarray)):
+                        difficulty = len(numbers)
+
+                if difficulty in diff_stats:
+                    diff_stats[difficulty]["total"] += 1
+                    if float(is_correct) > 0.5:
+                        diff_stats[difficulty]["correct"] += 1
+
+            for difficulty in (3, 4):
+                total = diff_stats[difficulty]["total"]
+                correct = diff_stats[difficulty]["correct"]
+                metric_dict[f"val-aux/difficulty/{difficulty}_count"] = float(total)
+                metric_dict[f"val-aux/difficulty/{difficulty}_acc"] = (float(correct) / float(total)) if total > 0 else 0.0
 
         return metric_dict
 

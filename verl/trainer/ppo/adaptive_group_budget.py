@@ -83,8 +83,6 @@ class AdaptiveGroupBudgetController:
         hard_prompt_count = int(hard_indices.shape[0])
 
         extras_per_prompt = np.zeros(num_prompts, dtype=np.int64)
-        base_extra = 0
-        remainder = 0
 
         if remaining_rollouts > 0 and hard_prompt_count > 0:
             base_extra = int(remaining_rollouts // hard_prompt_count)
@@ -115,29 +113,15 @@ class AdaptiveGroupBudgetController:
 
             extras_per_prompt[hard_indices] = hard_extras
 
-        assigned_extra_rollouts = int(extras_per_prompt.sum())
-        unused_rollouts = int(max(remaining_rollouts - assigned_extra_rollouts, 0))
-
         final_group_sizes = np.full(num_prompts, initial_group_size, dtype=np.int64) + extras_per_prompt
         hard_prompt_frac = float(hard_prompt_count / max(num_prompts, 1))
 
+        # Keep only compact, high-signal metrics that vary during training.
         metrics = {
-            "adaptive_group_budget/budget_group_size": float(budget_group_size),
-            "adaptive_group_budget/initial_group_size": float(initial_group_size),
-            "adaptive_group_budget/total_budget": float(total_budget_rollouts),
-            "adaptive_group_budget/stage1_rollouts": float(stage1_rollouts),
-            "adaptive_group_budget/remaining_budget": float(remaining_rollouts),
-            "adaptive_group_budget/hard_prompt_count": float(hard_prompt_count),
             "adaptive_group_budget/hard_prompt_frac": hard_prompt_frac,
-            "adaptive_group_budget/first_pass_all_correct_frac": float(1.0 - hard_prompt_frac),
-            "adaptive_group_budget/extras_base": float(base_extra),
-            "adaptive_group_budget/extras_remainder": float(remainder),
-            "adaptive_group_budget/extras_assigned": float(assigned_extra_rollouts),
-            "adaptive_group_budget/unused_budget": float(unused_rollouts),
-            "adaptive_group_budget/final_group_size_mean": float(final_group_sizes.mean()) if num_prompts > 0 else 0.0,
-            "adaptive_group_budget/final_group_size_max": float(final_group_sizes.max()) if num_prompts > 0 else 0.0,
-            "adaptive_group_budget/effective_avg_group_size": float(assigned_extra_rollouts + stage1_rollouts)
-            / float(max(num_prompts, 1)),
+            "adaptive_group_budget/easy_prompt_frac": float(1.0 - hard_prompt_frac),
+            "adaptive_group_budget/mean_group_size": float(final_group_sizes.mean()) if num_prompts > 0 else 0.0,
+            "adaptive_group_budget/max_group_size": float(final_group_sizes.max()) if num_prompts > 0 else 0.0,
         }
 
         return extras_per_prompt, metrics

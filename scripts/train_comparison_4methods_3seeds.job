@@ -1,12 +1,10 @@
 #!/bin/bash
-# Comprehensive comparison launcher:
-# 4 methods x 3 seeds = 12 runs via a single Slurm job array.
+# Smoke-test comparison launcher:
+# 2 methods x 2 seeds = 4 runs via a single Slurm job array.
 #
 # Methods:
 #   1) normalphased (baseline)
 #   2) grpo_lambda
-#   3) gamma
-#   4) gamma + tau
 
 #SBATCH --job-name=tinyzero_cmp4
 #SBATCH --partition=gpu_h100
@@ -14,10 +12,8 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=600G
-#SBATCH --time=03:00:00
-#SBATCH --array=0-11%1
-
-set -euo pipefail
+#SBATCH --time=4:00:00
+#SBATCH --array=0-3%1
 
 module purge
 module load 2025
@@ -25,6 +21,8 @@ module load CUDA/12.8.0
 
 source ~/.bashrc
 conda activate zero
+
+set -euo pipefail
 
 # Ensure ROCm vars do not conflict with CUDA
 unset ROCR_VISIBLE_DEVICES
@@ -46,17 +44,15 @@ export BASE_MODEL=${BASE_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
 export PROJECT_NAME=${PROJECT_NAME:-TinyZero}
 
 # Optional tag to group all runs in W&B/checkpoint names.
-export COMPARISON_TAG=${COMPARISON_TAG:-comparison_4methods_3seeds}
+export COMPARISON_TAG=${COMPARISON_TAG:-comparison_baseline_lambda_2seeds}
 
-# You can override seeds by exporting SEEDS_CSV, e.g. "11,22,33".
-SEEDS_CSV=${SEEDS_CSV:-11,22,33}
+# You can override seeds by exporting SEEDS_CSV, e.g. "11,22".
+SEEDS_CSV=${SEEDS_CSV:-11,22}
 IFS=',' read -r -a SEEDS <<< "$SEEDS_CSV"
 
 METHODS=(
     normalphased
     grpo_lambda
-    gamma
-    gamma_tau
 )
 
 TOTAL_TASKS=$(( ${#METHODS[@]} * ${#SEEDS[@]} ))
@@ -73,15 +69,9 @@ SEED_IDX=$(( TASK_ID % ${#SEEDS[@]} ))
 METHOD=${METHODS[$METHOD_IDX]}
 SEED=${SEEDS[$SEED_IDX]}
 
-TAU=${TAU:-0.04}
-TAU_TAG=${TAU//./p}
-
 EXPERIMENT_NAME="${COMPARISON_TAG}_${METHOD}_seed${SEED}"
-if [[ "$METHOD" == "gamma_tau" ]]; then
-    EXPERIMENT_NAME="${COMPARISON_TAG}_${METHOD}_tau${TAU_TAG}_seed${SEED}"
-fi
 
-LOG_DIR=${LOG_DIR:-logs/comparison_4methods_3seeds}
+LOG_DIR=${LOG_DIR:-logs/comparison_baseline_lambda_2seeds_smoke}
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/${EXPERIMENT_NAME}.log"
 
@@ -123,7 +113,7 @@ COMMON_ARGS=(
     "actor_rollout_ref.rollout.n=4"
     "actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP_SIZE"
     "actor_rollout_ref.rollout.name=vllm"
-    "actor_rollout_ref.rollout.gpu_memory_utilization=0.5"
+    "actor_rollout_ref.rollout.gpu_memory_utilization=0.6"
     "actor_rollout_ref.rollout.log_prob_micro_batch_size=32"
 
     "actor_rollout_ref.ref.log_prob_micro_batch_size=8"
@@ -183,38 +173,6 @@ case "$METHOD" in
             "agent.adaptive_window.initial_window=1024"
             "agent.adaptive_window.max_window=2048"
             'agent.adaptive_window.phased_schedule=[[50,2048]]'
-        )
-        ;;
-
-    gamma)
-        METHOD_ARGS=(
-            "algorithm.adv_estimator=grpo"
-            "algorithm.discounted_reasoning.enable=True"
-            "algorithm.discounted_reasoning.gamma=0.999"
-
-            "agent.adaptive_window.enable=True"
-            "agent.adaptive_window.mode=phased"
-            "agent.adaptive_window.initial_window=1024"
-            "agent.adaptive_window.max_window=2048"
-            'agent.adaptive_window.phased_schedule=[[50,2048]]'
-        )
-        ;;
-
-    gamma_tau)
-        METHOD_ARGS=(
-            "algorithm.adv_estimator=grpo"
-            "algorithm.discounted_reasoning.enable=True"
-            "algorithm.discounted_reasoning.gamma=0.999"
-            "algorithm.grpo_additive_normalization_enable=True"
-            "algorithm.grpo_additive_normalization_tau=$TAU"
-            "algorithm.incorrect_answer_penalty.enable=False"
-            "algorithm.incorrect_answer_penalty.penalty=-1.0"
-
-            "agent.adaptive_window.enable=True"
-            "agent.adaptive_window.mode=phased"
-            "agent.adaptive_window.initial_window=1024"
-            "agent.adaptive_window.max_window=2048"
-            'agent.adaptive_window.phased_schedule=[[20,2048]]'
         )
         ;;
 

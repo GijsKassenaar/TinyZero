@@ -1,10 +1,8 @@
 #!/bin/bash
-# GRPO-lambda baseline with only adaptive group-budget enabled.
-# Two-stage rollout budgeting:
-# - Stage 1: 2 rollouts per prompt for all prompts
-# - Stage 2: allocate remaining rollout budget to hard prompts
+# Gamma-discounted reasoning job with adaptive two-stage group budgeting.
+# This is based on the gamma job path (discounted_reasoning), not lambda-trace variants.
 
-#SBATCH --job-name=tinyzero_grpo_lambda_adaptive_budget
+#SBATCH --job-name=tinyzero_gamma_adaptive_budget
 #SBATCH --partition=gpu_h100
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:4
@@ -31,11 +29,11 @@ mkdir -p $WANDB_DIR
 
 cd $HOME/TinyZero
 
-export N_GPUS=${N_GPUS:-4}
-export ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
-export DATA_DIR=${DATA_DIR:-$PWD}
-export BASE_MODEL=${BASE_MODEL:-deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B}
-export EXPERIMENT_NAME=${EXPERIMENT_NAME:-test_grpo_lambda_adaptive_group_budget}
+export N_GPUS=4
+export ROLLOUT_TP_SIZE=1
+export DATA_DIR=$PWD
+export BASE_MODEL=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+export EXPERIMENT_NAME=test_gamma_0.999_adaptive_group
 
 python3 -m verl.trainer.main_ppo \
     data.train_files=$DATA_DIR/train.parquet \
@@ -49,7 +47,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.policy_loss.loss_mode=grpo_lambda \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size=8 \
     actor_rollout_ref.rollout.n=4 \
@@ -58,21 +55,14 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size=32 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=8 \
-    critic.enable=False \
-    algorithm.adv_estimator=grpo_lambda \
-    algorithm.gamma=1.0 \
-    algorithm.lam=0.99 \
-    algorithm.norm_adv_by_std_in_grpo=True \
     algorithm.use_kl_in_reward=False \
+    algorithm.norm_adv_by_std_in_grpo=True \
     algorithm.kl_ctrl.kl_coef=0.001 \
-    algorithm.grpo_lambda_variant.enable=False \
-    algorithm.grpo_lambda_variant.reasoning_only_discount_trace_enable=False \
+    algorithm.discounted_reasoning.enable=True \
+    algorithm.discounted_reasoning.gamma=0.999 \
     algorithm.adaptive_group_budget.enable=True \
     algorithm.adaptive_group_budget.initial_group_size=2 \
-    algorithm.adaptive_group_budget.budget_group_size=4 \
-    algorithm.adaptive_group_budget.correct_threshold=0.5 \
     algorithm.adaptive_group_budget.remainder_policy=round_robin \
-    agent.entropy_logging.enable=False \
     agent.adaptive_window.enable=True \
     agent.adaptive_window.mode=phased \
     agent.adaptive_window.initial_window=1024 \
@@ -80,7 +70,7 @@ python3 -m verl.trainer.main_ppo \
     agent.adaptive_window.phased_schedule='[[50,2048]]' \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.resume_mode=auto \
+    trainer.resume_mode=disable \
     trainer.total_training_steps=75 \
     trainer.save_freq=75 \
     trainer.test_freq=15 \
@@ -89,4 +79,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name=TinyZero \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.default_local_dir=$EXPERIMENT_NAME \
-    2>&1 | tee verl_grpo_lambda_adaptive_group_budget_test.log
+    2>&1 | tee verl_gamma_adaptive_group_budget_test.log
