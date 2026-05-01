@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Plot raw spread vs normalized-advantage spread for different normalizers.
+"""Plot raw spread vs normalized-advantage spread for additive normalization.
 
-This helps visualize how strongly each normalization method equalizes advantage
+This helps visualize how strongly the additive normalization equalizes advantage
 magnitudes across groups with different intrinsic spread.
 """
 
@@ -85,12 +85,10 @@ def main() -> None:
     # Always compute std and power references once.
     ref_methods = ["std", "power"]
     ref_curves: dict[str, list[float]] = {m: [] for m in ref_methods}
-    floor_curves: dict[float, list[float]] = {tau: [] for tau in taus}
     additive_curves: dict[float, list[float]] = {tau: [] for tau in taus}
 
     for target_std in raw_spreads:
         ref_spreads: dict[str, list[float]] = {m: [] for m in ref_methods}
-        floor_spreads: dict[float, list[float]] = {tau: [] for tau in taus}
         additive_spreads: dict[float, list[float]] = {tau: [] for tau in taus}
 
         for _ in range(args.trials):
@@ -101,36 +99,19 @@ def main() -> None:
                 ref_spreads[m].append(float(normalized.std()))
 
             for tau in taus:
-                floor_norm = _apply_normalization(centered, "floor", args.eps, tau, args.alpha)
                 add_norm = _apply_normalization(centered, "additive", args.eps, tau, args.alpha)
-                floor_spreads[tau].append(float(floor_norm.std()))
                 additive_spreads[tau].append(float(add_norm.std()))
 
         for m in ref_methods:
             ref_curves[m].append(float(np.mean(ref_spreads[m])))
         for tau in taus:
-            floor_curves[tau].append(float(np.mean(floor_spreads[tau])))
             additive_curves[tau].append(float(np.mean(additive_spreads[tau])))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.0, 5.0), sharex=True, sharey=True)
+    fig, ax = plt.subplots(1, 1, figsize=(6.5, 5.0))
 
-    # Left: floor sweep
-    ax = axes[0]
-    ax.plot(raw_spreads, ref_curves["std"], linestyle="--", linewidth=2, color="black", label="std reference")
-    for tau in taus:
-        ax.plot(raw_spreads, floor_curves[tau], linewidth=2, label=f"tau={tau:g}")
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_title("Floor Normalization: x/max(sigma, tau)")
-    ax.set_xlabel("Real spread (raw centered std)")
-    ax.set_ylabel("Normalized advantage spread (std)")
-    ax.grid(True, which="both", alpha=0.3)
-    ax.legend(fontsize=9)
-
-    # Right: additive sweep
-    ax = axes[1]
+    # Additive sweep
     ax.plot(raw_spreads, ref_curves["std"], linestyle="--", linewidth=2, color="black", label="std reference")
     for tau in taus:
         ax.plot(raw_spreads, additive_curves[tau], linewidth=2, label=f"tau={tau:g}")
@@ -138,6 +119,7 @@ def main() -> None:
     ax.set_yscale("log")
     ax.set_title("Additive Normalization: x/(sigma + tau)")
     ax.set_xlabel("Real spread (raw centered std)")
+    ax.set_ylabel("Normalized advantage spread (std)")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=9)
 

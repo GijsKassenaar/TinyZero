@@ -112,11 +112,14 @@ class DiscountedReasoningConfig(BaseConfig):
         gamma (float): Exponential decay base in gamma^K, where K is reasoning-token count.
         mixed_groups_only (bool): If True, apply discount only to correct samples in mixed
             groups (groups containing at least one correct and one incorrect sample).
+        unmixed_groups_only (bool): If True, apply discount only to correct samples in unmixed
+            groups (groups containing no incorrect samples). Mutually exclusive with mixed_groups_only.
     """
 
     enable: bool = False
     gamma: float = 0.999
     mixed_groups_only: bool = False
+    unmixed_groups_only: bool = False
 
 
 @dataclass

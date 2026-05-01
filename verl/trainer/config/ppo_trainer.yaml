@@ -164,6 +164,10 @@ algorithm:
     # If True, apply discounted reasoning only for correct samples in mixed groups
     mixed_groups_only: False
 
+    # If True, apply discounted reasoning only for correct samples in unmixed groups
+    # (groups containing no incorrect samples). Do not enable with mixed_groups_only.
+    unmixed_groups_only: False
+
   # GRPO-lambda variant controls
   grpo_lambda_variant:
 

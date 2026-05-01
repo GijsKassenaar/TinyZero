@@ -273,6 +273,7 @@ def compute_grpo_outcome_advantage(
     reasoning_lengths: Optional[torch.Tensor] = None,
     reasoning_discount_gamma: Optional[float] = None,
     reasoning_discount_mixed_groups_only: bool = False,
+    reasoning_discount_unmixed_groups_only: bool = False,
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
@@ -382,10 +383,12 @@ def compute_grpo_outcome_advantage(
             gamma = float(reasoning_discount_gamma)
             if gamma <= 0.0 or gamma > 1.0:
                 raise ValueError(f"discounted_reasoning.gamma must satisfy 0 < gamma <= 1, got {gamma}")
+            if reasoning_discount_mixed_groups_only and reasoning_discount_unmixed_groups_only:
+                raise ValueError("discounted_reasoning.mixed_groups_only and unmixed_groups_only cannot both be True")
             reasoning_lengths = reasoning_lengths.to(device=scores.device, dtype=scores.dtype)
             discount_factors = torch.pow(torch.full_like(reasoning_lengths, gamma), reasoning_lengths)
             discount_mask = is_correct > 0.5
-            if reasoning_discount_mixed_groups_only:
+            if reasoning_discount_mixed_groups_only or reasoning_discount_unmixed_groups_only:
                 group_has_correct: dict[Any, bool] = defaultdict(bool)
                 group_has_incorrect: dict[Any, bool] = defaultdict(bool)
                 for i in range(bsz):
@@ -394,11 +397,16 @@ def compute_grpo_outcome_advantage(
                         group_has_correct[group_key] = True
                     else:
                         group_has_incorrect[group_key] = True
-                mixed_group_mask = torch.zeros_like(discount_mask, dtype=torch.bool)
+                group_filter_mask = torch.zeros_like(discount_mask, dtype=torch.bool)
                 for i in range(bsz):
                     group_key = index[i]
-                    mixed_group_mask[i] = group_has_correct[group_key] and group_has_incorrect[group_key]
-                discount_mask = discount_mask & mixed_group_mask
+                    has_correct = group_has_correct[group_key]
+                    has_incorrect = group_has_incorrect[group_key]
+                    if reasoning_discount_mixed_groups_only:
+                        group_filter_mask[i] = has_correct and has_incorrect
+                    else:
+                        group_filter_mask[i] = has_correct and not has_incorrect
+                discount_mask = discount_mask & group_filter_mask
 
             scores = torch.where(discount_mask, scores * discount_factors, scores)
 
@@ -494,6 +502,8 @@ def compute_grpo_lambda_advantages(
     sequence_discount_gamma: float = 0.99999,
     reasoning_discount_enable: bool = False,
     reasoning_discount_gamma: float = 1.0,
+    reasoning_discount_mixed_groups_only: bool = False,
+    reasoning_discount_unmixed_groups_only: bool = False,
     token_normalization_enable: bool = False,
     additive_normalization_enable: bool = False,
     additive_normalization_tau: float = 0.02,
@@ -557,6 +567,8 @@ def compute_grpo_lambda_advantages(
     else:
         inferred_is_correct = inferred_is_correct.to(device=rewards.device, dtype=rewards.dtype)
 
+    group_valid = (valid_token_lengths > 0).to(dtype=rewards.dtype)
+
     if incorrect_answer_penalty_enable:
         sequence_rewards = torch.where(
             inferred_is_correct > 0.5,
@@ -578,18 +590,26 @@ def compute_grpo_lambda_advantages(
         gamma_reasoning = float(reasoning_discount_gamma)
         if gamma_reasoning <= 0.0 or gamma_reasoning > 1.0:
             raise ValueError(f"discounted_reasoning.gamma must satisfy 0 < gamma <= 1, got {gamma_reasoning}")
+        if reasoning_discount_mixed_groups_only and reasoning_discount_unmixed_groups_only:
+            raise ValueError("discounted_reasoning.mixed_groups_only and unmixed_groups_only cannot both be True")
         if reasoning_token_mask is not None:
             reasoning_lengths = reasoning_token_mask.to(dtype=rewards.dtype).sum(dim=-1)
         else:
             reasoning_lengths = torch.zeros_like(sequence_rewards)
         reasoning_discount_factors = torch.pow(torch.full_like(reasoning_lengths, gamma_reasoning), reasoning_lengths)
-        sequence_rewards = torch.where(
-            inferred_is_correct > 0.5,
-            sequence_rewards * reasoning_discount_factors,
-            sequence_rewards,
-        )
+        discount_mask = inferred_is_correct > 0.5
+        if reasoning_discount_mixed_groups_only or reasoning_discount_unmixed_groups_only:
+            correct_in_group = (inferred_is_correct > 0.5) & (group_valid > 0.0)
+            incorrect_in_group = (inferred_is_correct <= 0.5) & (group_valid > 0.0)
+            group_has_correct = correct_in_group.any(dim=1)
+            group_has_incorrect = incorrect_in_group.any(dim=1)
+            if reasoning_discount_mixed_groups_only:
+                group_qualifies = group_has_correct & group_has_incorrect
+            else:
+                group_qualifies = group_has_correct & ~group_has_incorrect
+            discount_mask = discount_mask & group_qualifies.unsqueeze(1)
+        sequence_rewards = torch.where(discount_mask, sequence_rewards * reasoning_discount_factors, sequence_rewards)
 
-    group_valid = (valid_token_lengths > 0).to(dtype=rewards.dtype)
     valid_group_count = group_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
 
     # Backward trace exponent computed from actual valid token positions per sequence.
@@ -677,6 +697,8 @@ def compute_grpo_lambda_outcome_advantage(
     reasoning_token_mask: Optional[torch.Tensor] = None,
     reasoning_discount_enable: bool = False,
     reasoning_discount_gamma: float = 1.0,
+    reasoning_discount_mixed_groups_only: bool = False,
+    reasoning_discount_unmixed_groups_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute GRPO-λ token-level advantages for flattened grouped trajectories.
 
@@ -791,6 +813,8 @@ def compute_grpo_lambda_outcome_advantage(
             sequence_discount_gamma=sequence_discount_gamma,
             reasoning_discount_enable=reasoning_discount_enable,
             reasoning_discount_gamma=reasoning_discount_gamma,
+            reasoning_discount_mixed_groups_only=reasoning_discount_mixed_groups_only,
+            reasoning_discount_unmixed_groups_only=reasoning_discount_unmixed_groups_only,
             token_normalization_enable=token_normalization_enable,
             additive_normalization_enable=additive_normalization_enable,
             additive_normalization_tau=additive_normalization_tau,

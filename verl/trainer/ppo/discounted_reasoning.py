@@ -104,6 +104,7 @@ def compute_reasoning_discount_metrics(
     is_correct: Optional[torch.Tensor] = None,
     index: Optional[np.ndarray] = None,
     mixed_groups_only: bool = False,
+    unmixed_groups_only: bool = False,
 ) -> dict[str, float]:
     """Compute discounted-reasoning metrics for the currently discounted sample subset.
 
@@ -113,18 +114,19 @@ def compute_reasoning_discount_metrics(
     gamma = float(gamma)
     if gamma <= 0.0 or gamma > 1.0:
         raise ValueError(f"discounted_reasoning.gamma must satisfy 0 < gamma <= 1, got {gamma}")
+    if mixed_groups_only and unmixed_groups_only:
+        raise ValueError("discounted_reasoning.mixed_groups_only and unmixed_groups_only cannot both be True")
 
     reasoning_lengths_tensor = reasoning_lengths_tensor.to(dtype=torch.float32)
     closed_think_tensor = closed_think_tensor.to(dtype=torch.bool)
     valid_response_lengths = valid_response_lengths.to(dtype=torch.long)
 
     valid_reasoning_mask = (valid_response_lengths > 0) & closed_think_tensor
-    mixed_group_mask = torch.ones_like(valid_reasoning_mask, dtype=torch.bool)
     if is_correct is not None:
         correct_mask = is_correct.to(dtype=torch.float32).reshape(-1) > 0.5
         if correct_mask.numel() == valid_reasoning_mask.numel():
             valid_reasoning_mask = valid_reasoning_mask & correct_mask
-            if mixed_groups_only and index is not None and len(index) == valid_reasoning_mask.numel():
+            if (mixed_groups_only or unmixed_groups_only) and index is not None and len(index) == valid_reasoning_mask.numel():
                 group_has_correct: dict[Any, bool] = {}
                 group_has_incorrect: dict[Any, bool] = {}
                 for i, group_key in enumerate(index):
@@ -134,12 +136,15 @@ def compute_reasoning_discount_metrics(
                     else:
                         group_has_incorrect[group_key] = True
 
-                mixed_group_mask = torch.zeros_like(valid_reasoning_mask, dtype=torch.bool)
+                group_filter_mask = torch.zeros_like(valid_reasoning_mask, dtype=torch.bool)
                 for i, group_key in enumerate(index):
-                    mixed_group_mask[i] = bool(group_has_correct.get(group_key, False)) and bool(
-                        group_has_incorrect.get(group_key, False)
-                    )
-                valid_reasoning_mask = valid_reasoning_mask & mixed_group_mask
+                    has_correct = bool(group_has_correct.get(group_key, False))
+                    has_incorrect = bool(group_has_incorrect.get(group_key, False))
+                    if mixed_groups_only:
+                        group_filter_mask[i] = has_correct and has_incorrect
+                    else:
+                        group_filter_mask[i] = has_correct and not has_incorrect
+                valid_reasoning_mask = valid_reasoning_mask & group_filter_mask
 
     discount_factors = torch.pow(
         torch.full_like(reasoning_lengths_tensor, gamma, dtype=torch.float32),

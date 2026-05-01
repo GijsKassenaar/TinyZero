@@ -251,6 +251,7 @@ def compute_advantage(
         reasoning_lengths = None
         reasoning_discount_gamma = None
         reasoning_discount_mixed_groups_only = False
+        reasoning_discount_unmixed_groups_only = False
         reasoning_discount_metrics = None
         discounted_reasoning_cfg = config.get("discounted_reasoning") if config is not None else None
         if discounted_reasoning_cfg is not None and bool(discounted_reasoning_cfg.get("enable", False)):
@@ -261,6 +262,7 @@ def compute_advantage(
             )
             reasoning_discount_gamma = float(discounted_reasoning_cfg.get("gamma", 1.0))
             reasoning_discount_mixed_groups_only = bool(discounted_reasoning_cfg.get("mixed_groups_only", False))
+            reasoning_discount_unmixed_groups_only = bool(discounted_reasoning_cfg.get("unmixed_groups_only", False))
             reasoning_discount_metrics = compute_reasoning_discount_metrics(
                 reasoning_lengths_tensor=reasoning_lengths,
                 closed_think_tensor=closed_think_tensor,
@@ -269,6 +271,7 @@ def compute_advantage(
                 is_correct=is_correct,
                 index=data.non_tensor_batch["uid"],
                 mixed_groups_only=reasoning_discount_mixed_groups_only,
+                unmixed_groups_only=reasoning_discount_unmixed_groups_only,
             )
 
         response_lengths = grpo_calculation_mask.sum(dim=-1)
@@ -283,6 +286,7 @@ def compute_advantage(
             reasoning_lengths=reasoning_lengths,
             reasoning_discount_gamma=reasoning_discount_gamma,
             reasoning_discount_mixed_groups_only=reasoning_discount_mixed_groups_only,
+            reasoning_discount_unmixed_groups_only=reasoning_discount_unmixed_groups_only,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             config=config,
         )
@@ -303,6 +307,8 @@ def compute_advantage(
 
         reasoning_discount_enable = False
         reasoning_discount_gamma = 1.0
+        reasoning_discount_mixed_groups_only = False
+        reasoning_discount_unmixed_groups_only = False
         reasoning_discount_metrics = None
         discounted_reasoning_cfg = config.get("discounted_reasoning") if config is not None else None
         if discounted_reasoning_cfg is not None and bool(discounted_reasoning_cfg.get("enable", False)):
@@ -316,12 +322,17 @@ def compute_advantage(
             ) = compute_reasoning_token_statistics(data, tokenizer)
             reasoning_discount_enable = True
             reasoning_discount_gamma = float(discounted_reasoning_cfg.get("gamma", 1.0))
+            reasoning_discount_mixed_groups_only = bool(discounted_reasoning_cfg.get("mixed_groups_only", False))
+            reasoning_discount_unmixed_groups_only = bool(discounted_reasoning_cfg.get("unmixed_groups_only", False))
             reasoning_discount_metrics = compute_reasoning_discount_metrics(
                 reasoning_lengths_tensor=reasoning_lengths,
                 closed_think_tensor=closed_think_tensor,
                 valid_response_lengths=valid_response_lengths,
                 gamma=reasoning_discount_gamma,
                 is_correct=is_correct,
+                index=data.non_tensor_batch["uid"],
+                mixed_groups_only=reasoning_discount_mixed_groups_only,
+                unmixed_groups_only=reasoning_discount_unmixed_groups_only,
             )
 
         variant_cfg = config.get("grpo_lambda_variant") if config is not None else None
@@ -347,6 +358,8 @@ def compute_advantage(
             reasoning_token_mask=reasoning_token_mask,
             reasoning_discount_enable=reasoning_discount_enable,
             reasoning_discount_gamma=reasoning_discount_gamma,
+            reasoning_discount_mixed_groups_only=reasoning_discount_mixed_groups_only,
+            reasoning_discount_unmixed_groups_only=reasoning_discount_unmixed_groups_only,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
